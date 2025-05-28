@@ -64,6 +64,7 @@ USE_COLUMN_SAMPLES = config.getboolean('CONFIG','USE_COLUMN_SAMPLES')
 
 #[GCP]
 PROJECT_ID =  config['GCP']['PROJECT_ID']
+GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY_PATH = config.get('GCP', 'GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY_PATH', fallback=None)
 
 #[PGCLOUDSQL]
 PG_REGION = config['PGCLOUDSQL']['PG_REGION']
@@ -107,6 +108,7 @@ __all__ = ["EMBEDDING_MODEL",
            "BQ_LOG_TABLE_NAME",
         #    "BQ_TABLE_LIST",
            "FIRESTORE_REGION",
-           "PROMPTS"
+           "PROMPTS",
+           "GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY_PATH", # Added
            "root_dir",
            "save_config"]

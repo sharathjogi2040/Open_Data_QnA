@@ -2,7 +2,8 @@ from .core import DBConnector
 from .PgConnector import PgConnector, pg_specific_data_types
 from .BQConnector import BQConnector, bq_specific_data_types
 from .FirestoreConnector import FirestoreConnector
-from .JsonConnector import JsonConnector # Added JsonConnector import
+from .JsonConnector import JsonConnector
+from .GoogleSheetConnector import GoogleSheetConnector # Added GoogleSheetConnector import
 # Configuration values (PROJECT_ID, etc.) are no longer imported directly from utilities.
 # They should be passed by the caller of get_connector.
 
@@ -11,12 +12,13 @@ def get_connector(source_type: str, **kwargs) -> DBConnector:
     Factory function to get a database connector instance.
 
     Args:
-        source_type (str): Type of the data source (e.g., 'bigquery', 'postgresql', 'firestore', 'json').
+        source_type (str): Type of the data source (e.g., 'bigquery', 'postgresql', 'firestore', 'json', 'googlesheet').
         **kwargs: Connector-specific configuration arguments.
                   Expected for 'bigquery': project_id, region, opendataqna_dataset, audit_log_table_name
                   Expected for 'postgresql': project_id, region, instance_name, database_name, database_user, database_password
                   Expected for 'firestore': project_id, firestore_database
                   Expected for 'json': file_path or json_data (and other optional DBConnector args)
+                  Expected for 'googlesheet': sheet_id_or_url, credentials_path (and optional worksheet_name, project_id, database_name)
 
     Returns:
         DBConnector: An instance of the appropriate DBConnector.
@@ -67,11 +69,27 @@ def get_connector(source_type: str, **kwargs) -> DBConnector:
             json_data=kwargs.get('json_data'),
             project_id=kwargs.get('project_id'), # Optional, for DBConnector base
             region=kwargs.get('region'), # Optional
-            instance_name=kwargs.get('instance_name'), # Optional
+            instance_name=kwargs.get('instance_name'),
             database_name=kwargs.get('database_name', kwargs.get('file_path')), # Default database_name to file_path
-            database_user=kwargs.get('database_user'), # Optional
-            database_password=kwargs.get('database_password'), # Optional
-            dataset_name=kwargs.get('dataset_name') # Optional
+            database_user=kwargs.get('database_user'),
+            database_password=kwargs.get('database_password'),
+            dataset_name=kwargs.get('dataset_name')
+        )
+    elif source_type_lower == 'googlesheet':
+        required_gs_args = ['sheet_id_or_url', 'credentials_path']
+        missing_gs_args = [k for k in required_gs_args if kwargs.get(k) is None]
+        if missing_gs_args:
+            raise ValueError(f"Missing required arguments for GoogleSheet connector: {', '.join(missing_gs_args)}")
+        
+        return GoogleSheetConnector(
+            sheet_id_or_url=kwargs['sheet_id_or_url'],
+            credentials_path=kwargs['credentials_path'],
+            worksheet_name=kwargs.get('worksheet_name'), # Optional
+            project_id=kwargs.get('project_id'), # Optional, for DBConnector base
+            database_name=kwargs.get('database_name', kwargs['sheet_id_or_url']), # Default to sheet_id_or_url
+            # Pass other optional DBConnector fields if provided in kwargs
+            # These are already passed to GoogleSheetConnector's **kwargs and handled by its super().__init__
+            **kwargs # Pass remaining kwargs for DBConnector base class flexibility
         )
     else:
         raise ValueError(f"Unknown source_type: {source_type}")
@@ -91,7 +109,8 @@ __all__ = [
     'PgConnector', 
     'BQConnector', 
     'FirestoreConnector',
-    'JsonConnector',  # Added JsonConnector to __all__
+    'JsonConnector',
+    'GoogleSheetConnector', # Added GoogleSheetConnector to __all__
     'pg_specific_data_types', 
     'bq_specific_data_types'
 ]

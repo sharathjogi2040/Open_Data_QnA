@@ -14,6 +14,12 @@ try:
 except ImportError:
     FIRESTORE_DATABASE_NAME = "opendataqna-session-logs" # Default value
 
+# Attempt to import GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY_PATH
+try:
+    from utilities import GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY_PATH
+except ImportError:
+    GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY_PATH = None # Fallback if not defined
+
 from dbconnectors import get_connector # Changed import
 from embeddings.store_embeddings import add_sql_embedding
 
@@ -61,6 +67,16 @@ def generate_uuid():
     """
     return str(uuid.uuid4())
 
+def parse_gsheet_user_grouping(user_grouping: str) -> tuple[str | None, str | None]:
+    """Parses user_grouping like 'gsheet::SHEET_ID_OR_URL[::WORKSHEET_NAME]'"""
+    if not user_grouping.lower().startswith('gsheet::'):
+        return None, None
+    parts = user_grouping.split('::')
+    sheet_id_or_url = parts[1] if len(parts) > 1 else None
+    worksheet_name = parts[2] if len(parts) > 2 else None
+    if not sheet_id_or_url: # Ensure sheet_id_or_url is not empty if prefix found
+            raise ValueError("Google Sheet ID or URL is missing after 'gsheet::' prefix.")
+    return sheet_id_or_url, worksheet_name
 
 ############################
 #_____GET ALL DATABASES_____#
@@ -211,10 +227,40 @@ async def generate_sql(session_id,
         AUDIT_TEXT = ''
         # Ensure DATA_SOURCE is initialized before the try-except block for LOGGING in exception
         DATA_SOURCE = 'undefined' 
-        SQLBuilder_model_name = SQLBuilder_model # To use in exception log if DATA_SOURCE is JSON
+        SQLBuilder_model_name = SQLBuilder_model # To use in exception log if DATA_SOURCE is JSON or GSheet
+        found_in_vector = 'N/A' # Default for non-SQL paths or if not found
 
-        # JSON Source Identification
-        if user_grouping.lower().endswith('.json'):
+        # Google Sheet Source Identification
+        parsed_sheet_id, parsed_worksheet_name = parse_gsheet_user_grouping(user_grouping)
+        if parsed_sheet_id:
+            DATA_SOURCE = 'googlesheet'
+            src_invalid = False
+            print(f"Data source identified as Google Sheet: {parsed_sheet_id}, Worksheet: {parsed_worksheet_name}")
+            AUDIT_TEXT = f"Google Sheet Data Source: {user_grouping}\nUser Question: {user_question}\n"
+            final_sql = None # No SQL for Google Sheets
+            invalid_response = False
+            process_step = "Google Sheet Data Loading (to be done in get_results)"
+
+            if LOGGING: # Simplified audit for GSheet
+                try:
+                    if vector_connector.connectorType == "BigQuery": # Only log if vector_connector is BQ
+                        vector_connector.make_audit_entry(
+                            source_type=DATA_SOURCE, user_grouping=user_grouping,
+                            model="N/A_GSHEET", question=user_question, generated_sql=final_sql,
+                            found_in_vector=found_in_vector, need_rewrite='N/A', failure_step='N/A',
+                            error_msg='', full_log_text=AUDIT_TEXT
+                        )
+                except Exception as audit_e:
+                    print(f"Audit logging failed for Google Sheet source: {audit_e}")
+            
+            if USE_SESSION_HISTORY and not invalid_response:
+                firestore_connector_instance.log_chat(session_id, user_question, 
+                                                      "Processing Google Sheet data.", # Placeholder
+                                                      user_id)
+            return final_sql, session_id, invalid_response # Return early
+
+        # JSON Source Identification (if not Google Sheet)
+        elif user_grouping.lower().endswith('.json'):
             DATA_SOURCE = 'json'
             src_invalid = False
             print(f"Data source identified as JSON file: {user_grouping}")
@@ -222,12 +268,10 @@ async def generate_sql(session_id,
             final_sql = None  # No SQL for JSON
             invalid_response = False
             process_step = "JSON Data Loading (to be done in get_results)"
-            found_in_vector = 'N/A' # Not applicable for JSON
+            # found_in_vector already 'N/A'
 
-            # Simplified audit logging for JSON
-            if LOGGING:
+            if LOGGING: # Simplified audit logging for JSON
                 try:
-                    # Only log if vector_connector is BigQuery to avoid NotImplementedError
                     if vector_connector.connectorType == "BigQuery":
                         vector_connector.make_audit_entry(
                             source_type=DATA_SOURCE, user_grouping=user_grouping,
@@ -243,13 +287,13 @@ async def generate_sql(session_id,
                                                       "Processing JSON data.",  # Placeholder
                                                       user_id)
             return final_sql, session_id, invalid_response  # Return early for JSON
-        else:
+        else: # SQL-based data source
             DATA_SOURCE, src_invalid = get_source_type(user_grouping)
             if src_invalid:
-                # Ensure DATA_SOURCE from get_source_type is a string if it's an error message
-                raise ValueError(str(DATA_SOURCE)) 
+                raise ValueError(str(DATA_SOURCE))
+            found_in_vector = 'N' # Reset for SQL path
 
-        ## LOAD AGENTS (only if not JSON)
+        ## LOAD AGENTS (only if not GSheet or JSON)
         print("Loading Agents.")
         embedder = EmbedderAgent(Embedder_model)
         SQLBuilder = BuildSQLAgent(SQLBuilder_model)
@@ -331,21 +375,23 @@ async def generate_sql(session_id,
         invalid_response = True
         AUDIT_TEXT = (AUDIT_TEXT if AUDIT_TEXT else "") + f"\nException in generate_sql: {error_msg}" # Ensure AUDIT_TEXT is a string
         print("Error :: " + str(error_msg))
-        if LOGGING and DATA_SOURCE != 'json': # Only log here if not JSON, JSON path logs earlier or this is SQL path error
+        # Conditional logging for SQL path errors
+        if LOGGING and DATA_SOURCE not in ['json', 'googlesheet']: 
             try:
-                if vector_connector.connectorType == "BigQuery": # Or a more generic check
+                if vector_connector.connectorType == "BigQuery":
                     vector_connector.make_audit_entry(
                         source_type=DATA_SOURCE, user_grouping=user_grouping,
                         model=SQLBuilder_model_name, question=user_question, generated_sql=final_sql,
-                        found_in_vector=found_in_vector if DATA_SOURCE != 'json' else 'N/A', 
-                        need_rewrite="", # empty string if not applicable
+                        found_in_vector=found_in_vector, 
+                        need_rewrite="", 
                         failure_step=process_step, error_msg=error_msg, full_log_text=AUDIT_TEXT
                     )
             except Exception as audit_e_exception:
                 print(f"Audit logging failed during exception handling: {audit_e_exception}")
     
-    # Session log for SQL path (successful or failed SQL gen) or if JSON path failed before early return (less likely)
-    if USE_SESSION_HISTORY and DATA_SOURCE != 'json': # JSON path logs earlier before its early return
+    # Session log for SQL path (successful or failed SQL gen)
+    # JSON and GSheet paths log earlier before their early return if successful
+    if USE_SESSION_HISTORY and DATA_SOURCE not in ['json', 'googlesheet']: 
         firestore_connector_instance.log_chat(session_id, user_question, final_sql, user_id)
         print("Session history persisted for SQL path.")
 
@@ -378,22 +424,31 @@ def get_results(user_grouping, final_sql, invalid_response=False, EXECUTE_FINAL_
     """
     result_df = None # Initialize result_df
     try:
-        # JSON Source Identification
-        if user_grouping.lower().endswith('.json'):
+        parsed_sheet_id, parsed_worksheet_name = parse_gsheet_user_grouping(user_grouping)
+        if parsed_sheet_id:
+            DATA_SOURCE = 'googlesheet'
+            src_invalid = False
+        elif user_grouping.lower().endswith('.json'):
             DATA_SOURCE = 'json'
             src_invalid = False
         else:
             DATA_SOURCE, src_invalid = get_source_type(user_grouping)
 
         if src_invalid:
-            # Ensure DATA_SOURCE from get_source_type is a string if it's an error message
-            raise ValueError(str(DATA_SOURCE)) 
+            raise ValueError(str(DATA_SOURCE))
 
         src_connector_params = {"project_id": PROJECT_ID}
-        if DATA_SOURCE.lower() == 'json':
+        if DATA_SOURCE.lower() == 'googlesheet':
+            if not GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY_PATH:
+                raise ValueError("Google Sheets service account key path not configured in utilities.")
+            src_connector_params.update({
+                "sheet_id_or_url": parsed_sheet_id,
+                "credentials_path": GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY_PATH,
+                "worksheet_name": parsed_worksheet_name
+            })
+            src_connector = get_connector(source_type='googlesheet', **src_connector_params)
+        elif DATA_SOURCE.lower() == 'json':
             src_connector_params.update({"file_path": user_grouping})
-            # Optional: pass other generic params if JsonConnector handles them via **kwargs in its __init__
-            # src_connector_params.update({"database_name": user_grouping}) # Example
             src_connector = get_connector(source_type='json', **src_connector_params)
         elif DATA_SOURCE.lower() == 'bigquery':
             src_connector_params.update({
@@ -412,38 +467,35 @@ def get_results(user_grouping, final_sql, invalid_response=False, EXECUTE_FINAL_
             })
             src_connector = get_connector(source_type='postgresql', **src_connector_params)
         else:
-            raise ValueError(f"Unsupported DATA_SOURCE: {DATA_SOURCE}")
+            raise ValueError(f"Unsupported DATA_SOURCE for get_results: {DATA_SOURCE}")
 
         if not invalid_response:  # invalid_response from generate_sql
             try:
                 if EXECUTE_FINAL_SQL is True:
-                    if DATA_SOURCE.lower() == 'json':
-                        # For JSON, final_sql is None from generate_sql path for JSON
-                        # query arg is optional for JsonConnector.retrieve_df
+                    if DATA_SOURCE.lower() in ['json', 'googlesheet']:
+                        # For JSON/GSheet, final_sql is None from generate_sql path
                         result_df = src_connector.retrieve_df(query=None)
                     else:
-                        if final_sql is None: # Should not happen for SQL types if generate_sql worked
+                        if final_sql is None: 
                             raise ValueError("final_sql cannot be None for SQL data sources if generate_sql was successful.")
                         cleaned_sql = final_sql.replace("```sql", "").replace("```", "").replace("EXPLAIN ANALYZE ", "")
                         result_df = src_connector.retrieve_df(cleaned_sql)
                 else:
                     print("Not executing final SQL since EXECUTE_FINAL_SQL variable is False\n ")
-                    result_df = "Query execution skipped." # Changed to a string
-                    invalid_response = True # Mark as invalid as no data is loaded
-            except Exception as e_exec: # Catch any execution error
+                    result_df = "Query execution skipped." 
+                    invalid_response = True 
+            except Exception as e_exec: 
                 print(f"Error during query execution or data retrieval: {e_exec}")
                 result_df = f"Error during query execution or data retrieval: {e_exec}"
                 invalid_response = True
-        else: # invalid_response was true from generate_sql
-            # If final_sql is None (JSON path), use a more specific message.
-            error_source_msg = final_sql if final_sql else "No query generated (e.g. JSON input)"
+        else: 
+            error_source_msg = final_sql if final_sql else "No query generated (e.g. JSON/GSheet input)"
             result_df = f"Not executing due to invalid response from previous step: {error_source_msg}"
-            # invalid_response is already True
 
-    except Exception as e_get_res: # Catch errors from get_source_type or connector init
+    except Exception as e_get_res: 
         print(f"An error occurred in get_results: {e_get_res}")
-        result_df = f"Error in get_results: {e_get_res}" # Ensure result_df is always a string on error path
-        invalid_response = True # Ensure this is set
+        result_df = f"Error in get_results: {e_get_res}" 
+        invalid_response = True 
 
     return result_df, invalid_response
 

@@ -58,3 +58,70 @@ If you have a local JSON file named `my_project_data.json` in your current worki
 For example:
 `python opendataqna.py --user_question "How many records are there?" --user_grouping "my_project_data.json"`
 The system will then load `my_project_data.json`, and the LLM will attempt to answer your question based on the data it contains.
+
+### Using Google Sheets as a Data Source
+
+The Open Data QnA application now supports using Google Sheets as a direct data source. This allows you to ask questions about data contained within a Google Sheet.
+
+**Setup Requirements:**
+
+1.  **Enable Google Sheets API**:
+    *   In your Google Cloud Project, navigate to "APIs & Services" > "Library".
+    *   Search for "Google Sheets API" and ensure it is enabled for your project.
+2.  **Create a Service Account**:
+    *   In the GCP Console, go to "IAM & Admin" > "Service Accounts".
+    *   Click "+ CREATE SERVICE ACCOUNT".
+    *   Provide a name and description for the service account.
+    *   Grant appropriate project roles if necessary (though for reading sheets, specific roles on the Sheet itself are more critical than project roles).
+    *   Click "DONE".
+    *   Once created, find the service account in the list, click on it, go to the "KEYS" tab.
+    *   Click "ADD KEY" > "Create new key".
+    *   Select "JSON" as the key type and click "CREATE". A JSON key file will be downloaded.
+3.  **Share Google Sheet**:
+    *   Open the Google Sheet you intend to use.
+    *   Click the "Share" button (usually top right).
+    *   In the "Share with people and groups" dialog, enter the email address of the service account you created (e.g., `your-service-account-name@your-project-id.iam.gserviceaccount.com`). This email is found in the service account's details in GCP or within the downloaded JSON key file (`client_email` field).
+    *   Grant the service account at least "Viewer" permissions. "Editor" permissions are not required for read-only access by this application.
+    *   Click "Send" or "Share".
+4.  **Configure Application**:
+    *   **Store Key File**: Place the downloaded service account JSON key file in a secure location accessible by the Open Data QnA application.
+    *   **Update `config.ini`**: In your `config.ini` file, add or ensure the following line is present under the `[GCP]` section, pointing to the path of your key file:
+        ```ini
+        [GCP]
+        # ... other GCP settings like PROJECT_ID ...
+        GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY_PATH = /path/to/your/service-account-key.json
+        ```
+        (Replace `/path/to/your/service-account-key.json` with the actual path.)
+    *   **Ensure Utility Exposure**: The application expects the `GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY_PATH` to be loaded from `config.ini` and made available via the `utilities` module. If you've recently added this setting, ensure `utilities/__init__.py` exports this variable.
+
+**Specifying a Google Sheet:**
+
+To use a Google Sheet as a data source, you need to provide a specially formatted identifier as the `user_grouping` argument (or its equivalent in the UI). The format is:
+
+`gsheet::SHEET_ID_OR_URL[::WORKSHEET_NAME]`
+
+Where:
+*   `gsheet::` is a mandatory prefix.
+*   `SHEET_ID_OR_URL`: This can be either:
+    *   The full URL of the Google Sheet (e.g., `https://docs.google.com/spreadsheets/d/your_sheet_id/edit`).
+    *   Just the Sheet ID itself (e.g., `your_sheet_id` from the URL).
+*   `::WORKSHEET_NAME` (optional): This is the specific name of the tab (worksheet) within the spreadsheet you want to query.
+    *   If this part is omitted, the application will attempt to read data from the first visible worksheet in the Google Sheet.
+    *   The `::` is used as a separator.
+
+**Examples:**
+
+*   To query the first visible worksheet of a sheet with ID `abc123xyz789`:
+    `gsheet::abc123xyz789`
+*   To query a specific worksheet named `My Data Tab` in the sheet with ID `abc123xyz789`:
+    `gsheet::abc123xyz789::My Data Tab`
+*   Using the full URL for the same sheet and specific tab:
+    `gsheet::https://docs.google.com/spreadsheets/d/abc123xyz789/edit::My Data Tab`
+
+**Current Functionality & Limitations:**
+
+*   **Data Loading**: The connector loads all data from the specified worksheet (or the first visible one if no specific worksheet name is provided) into a pandas DataFrame. The first row of the sheet is typically assumed to be the header row.
+*   **Question Answering**: Natural language questions are answered based on the content and structure of this in-memory DataFrame.
+*   **No Direct SQL Querying**: The system does not perform SQL-like queries directly against the Google Sheet itself.
+*   **No Vector Store Features**: Features related to schema embedding, table/column similarity search, and example query matching (which are available for SQL databases connected to the vector store) are not applicable to Google Sheets sources in the current implementation. The focus is on direct data retrieval and interpretation from the specified sheet.
+*   **Read-Only**: The current connector is designed for read-only access.

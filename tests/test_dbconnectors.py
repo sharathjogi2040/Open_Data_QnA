@@ -2,10 +2,11 @@ import pytest
 from unittest.mock import patch, MagicMock, mock_open
 import pandas as pd
 import json # Added for JsonConnector tests
+import gspread # for gspread.exceptions
 
 # Assuming dbconnectors and utilities are importable.
 # This might require specific PYTHONPATH setup depending on execution environment.
-from dbconnectors import get_connector, DBConnector, BQConnector, PgConnector, FirestoreConnector, JsonConnector # Added JsonConnector
+from dbconnectors import get_connector, DBConnector, BQConnector, PgConnector, FirestoreConnector, JsonConnector, GoogleSheetConnector # Added GoogleSheetConnector
 from utilities import (
     PROJECT_ID, BQ_REGION, BQ_OPENDATAQNA_DATASET_NAME, BQ_LOG_TABLE_NAME,
     PG_REGION, PG_INSTANCE, PG_DATABASE, PG_USER, PG_PASSWORD,
@@ -36,6 +37,12 @@ VALID_JSON_KWARGS_FULL_FILE = {
     "project_id": PROJECT_ID, "region": "us-central1", "instance_name": "test-instance",
     "database_name": "dummy_path.json", "database_user": None, "database_password": None,
     "dataset_name": None, "file_path": "dummy_path.json", "json_data": None
+}
+VALID_GSHEET_KWARGS = {
+    "sheet_id_or_url": "dummy_sheet_id",
+    "credentials_path": "dummy_creds.json",
+    "worksheet_name": "Sheet1", 
+    "project_id": PROJECT_ID 
 }
 
 
@@ -320,6 +327,176 @@ class TestJsonConnector:
     def test_json_connector_interface_methods_not_implemented(self):
         """Test that other DBConnector interface methods raise NotImplementedError."""
         connector = JsonConnector(json_data='[]') # Needs valid init
+        
+        with pytest.raises(NotImplementedError):
+            connector.getExactMatches("query")
+        with pytest.raises(NotImplementedError):
+            connector.getSimilarMatches("mode", "group", [], 1, 0.1)
+        with pytest.raises(NotImplementedError):
+            connector.make_audit_entry("s_type", "group", "model", "q", "sql", "fv", "nr", "fs", "em", "flt")
+        with pytest.raises(NotImplementedError):
+            connector.return_table_schema_sql("dataset")
+        with pytest.raises(NotImplementedError):
+            connector.return_column_schema_sql("dataset")
+        with pytest.raises(NotImplementedError):
+            connector.test_sql_plan_execution("sql")
+        with pytest.raises(NotImplementedError):
+            connector.get_column_samples(pd.DataFrame())
+        with pytest.raises(NotImplementedError):
+            connector.log_chat("sid", "uq", "sql", "uid")
+        with pytest.raises(NotImplementedError):
+            connector.get_chat_logs_for_session("sid")
+
+# --- Tests for GoogleSheetConnector in get_connector factory ---
+
+def test_get_gsheet_connector_successful():
+    """Test successful creation of GoogleSheetConnector via factory."""
+    # gspread.service_account will be mocked by the mock_gspread fixture if used,
+    # or needs to be handled if mock_external_clients is solely relied upon.
+    # For get_connector tests, we usually don't need deep gspread functionality,
+    # just that the class can be instantiated.
+    # Assuming gspread.service_account does not raise error during basic init.
+    with patch('gspread.service_account'): # Simple patch for get_connector tests
+        connector = get_connector('googlesheet', **VALID_GSHEET_KWARGS)
+        assert isinstance(connector, DBConnector)
+        assert isinstance(connector, GoogleSheetConnector)
+        assert connector.connectorType == "GoogleSheet"
+
+def test_get_gsheet_connector_missing_args():
+    """Test get_connector for GoogleSheet with missing arguments."""
+    with pytest.raises(ValueError, match="Missing required arguments for GoogleSheet connector: credentials_path"):
+        get_connector('googlesheet', sheet_id_or_url="dummy_id")
+
+# --- Fixture for GoogleSheetConnector tests ---
+@pytest.fixture
+def mock_gspread(mocker):
+    """Mocks gspread client, spreadsheet, and worksheet objects."""
+    mock_gspread_client = MagicMock(spec=gspread.Client)
+    mock_spreadsheet = MagicMock(spec=gspread.Spreadsheet)
+    mock_worksheet = MagicMock(spec=gspread.Worksheet)
+
+    mock_gspread_client.open_by_key.return_value = mock_spreadsheet
+    mock_gspread_client.open_by_url.return_value = mock_spreadsheet
+    mock_spreadsheet.worksheet.return_value = mock_worksheet
+    mock_spreadsheet.sheet1 = mock_worksheet # For default worksheet access
+    mock_spreadsheet.title = "Mocked Sheet Title"
+
+    mocker.patch('gspread.service_account', return_value=mock_gspread_client)
+    
+    return mock_gspread_client, mock_spreadsheet, mock_worksheet
+
+# --- Tests for GoogleSheetConnector class itself ---
+
+class TestGoogleSheetConnector:
+
+    def test_gsheet_connector_init(self):
+        """Test GoogleSheetConnector __init__ with required args."""
+        # No gspread calls in __init__ itself, so no mock needed here beyond what autouse might do
+        with patch('gspread.service_account'): # Prevent actual call if any future init change
+            connector = GoogleSheetConnector(
+                sheet_id_or_url="test_id",
+                credentials_path="test_creds.json",
+                worksheet_name="TestSheet"
+            )
+            assert connector.sheet_id_or_url == "test_id"
+            assert connector.credentials_path == "test_creds.json"
+            assert connector.worksheet_name == "TestSheet"
+            assert connector.client is None # Client initialized on first connect
+
+    def test_gsheet_connector_connect_success(self, mock_gspread):
+        """Test _connect method successfully initializes self.client."""
+        connector = GoogleSheetConnector(**VALID_GSHEET_KWARGS)
+        client = connector._connect()
+        assert client is not None
+        assert connector.client is client
+        gspread.service_account.assert_called_once_with(filename=VALID_GSHEET_KWARGS['credentials_path'])
+
+    def test_gsheet_connector_connect_failure(self, mocker):
+        """Test _connect method raises ConnectionError if gspread.service_account fails."""
+        mocker.patch('gspread.service_account', side_effect=Exception("Auth failed"))
+        connector = GoogleSheetConnector(**VALID_GSHEET_KWARGS)
+        with pytest.raises(ConnectionError, match="Failed to authenticate with Google Sheets"):
+            connector._connect()
+
+    def test_gsheet_retrieve_df_success_by_id_and_worksheet_name(self, mock_gspread):
+        """Test retrieve_df success with sheet ID and worksheet name."""
+        _, mock_spreadsheet, mock_worksheet = mock_gspread
+        sample_data = [{"col1": "a", "col2": 1}, {"col1": "b", "col2": 2}]
+        mock_worksheet.get_all_records.return_value = sample_data
+        
+        connector = GoogleSheetConnector(**VALID_GSHEET_KWARGS) # Uses "dummy_sheet_id", "Sheet1"
+        df = connector.retrieve_df()
+        
+        expected_df = pd.DataFrame(sample_data)
+        pd.testing.assert_frame_equal(df, expected_df)
+        gspread.service_account.assert_called_once()
+        mock_gspread[0].open_by_key.assert_called_once_with("dummy_sheet_id")
+        mock_spreadsheet.worksheet.assert_called_once_with("Sheet1")
+        mock_worksheet.get_all_records.assert_called_once()
+        assert connector.database_name == "Mocked Sheet Title" # Check database_name update
+
+    def test_gsheet_retrieve_df_success_by_url_default_worksheet(self, mock_gspread):
+        """Test retrieve_df success with sheet URL and default worksheet."""
+        mock_gs_client, mock_spreadsheet, mock_worksheet = mock_gspread
+        sample_data = [{"headerA": "valA", "headerB": "valB"}]
+        mock_worksheet.get_all_records.return_value = sample_data
+        
+        gsheet_url = "https://docs.google.com/spreadsheets/d/dummy_sheet_id_url"
+        connector = GoogleSheetConnector(
+            sheet_id_or_url=gsheet_url,
+            credentials_path="dummy_creds.json"
+            # worksheet_name is None, so should use sheet1
+        )
+        df = connector.retrieve_df()
+        
+        expected_df = pd.DataFrame(sample_data)
+        pd.testing.assert_frame_equal(df, expected_df)
+        mock_gs_client.open_by_url.assert_called_once_with(gsheet_url)
+        assert mock_spreadsheet.sheet1 == mock_worksheet # Verifies default access
+        mock_worksheet.get_all_records.assert_called_once()
+
+    def test_gsheet_retrieve_df_empty_sheet(self, mock_gspread):
+        """Test retrieve_df with an empty sheet."""
+        _, _, mock_worksheet = mock_gspread
+        mock_worksheet.get_all_records.return_value = []
+        
+        connector = GoogleSheetConnector(**VALID_GSHEET_KWARGS)
+        df = connector.retrieve_df()
+        
+        assert df.empty
+        pd.testing.assert_frame_equal(df, pd.DataFrame())
+
+    def test_gsheet_retrieve_df_spreadsheet_not_found(self, mock_gspread):
+        """Test retrieve_df when SpreadsheetNotFound is raised."""
+        mock_gs_client, _, _ = mock_gspread
+        mock_gs_client.open_by_key.side_effect = gspread.exceptions.SpreadsheetNotFound
+        
+        connector = GoogleSheetConnector(**VALID_GSHEET_KWARGS)
+        with pytest.raises(FileNotFoundError, match="Google Sheet not found with ID/URL: dummy_sheet_id"):
+            connector.retrieve_df()
+
+    def test_gsheet_retrieve_df_worksheet_not_found(self, mock_gspread):
+        """Test retrieve_df when WorksheetNotFound is raised."""
+        _, mock_spreadsheet, _ = mock_gspread
+        mock_spreadsheet.worksheet.side_effect = gspread.exceptions.WorksheetNotFound
+        
+        connector = GoogleSheetConnector(**VALID_GSHEET_KWARGS) # worksheet_name="Sheet1"
+        with pytest.raises(ValueError, match="Worksheet 'Sheet1' not found in sheet 'Mocked Sheet Title'."):
+            connector.retrieve_df()
+            
+    def test_gsheet_retrieve_df_authentication_error(self, mocker):
+        """Test retrieve_df when gspread.service_account raises auth error."""
+        mocker.patch('gspread.service_account', side_effect=Exception("Simulated Auth Error"))
+        
+        connector = GoogleSheetConnector(**VALID_GSHEET_KWARGS)
+        with pytest.raises(ConnectionError, match="Failed to authenticate with Google Sheets"):
+            connector.retrieve_df() # _connect will be called here
+
+    def test_gsheet_connector_interface_methods_not_implemented(self):
+        """Test that other DBConnector interface methods raise NotImplementedError."""
+        # Minimal init, _connect won't be called unless retrieve_df is
+        with patch('gspread.service_account'): # Mock to allow init
+            connector = GoogleSheetConnector(**VALID_GSHEET_KWARGS)
         
         with pytest.raises(NotImplementedError):
             connector.getExactMatches("query")
