@@ -3,7 +3,8 @@ from .PgConnector import PgConnector, pg_specific_data_types
 from .BQConnector import BQConnector, bq_specific_data_types
 from .FirestoreConnector import FirestoreConnector
 from .JsonConnector import JsonConnector
-from .GoogleSheetConnector import GoogleSheetConnector # Added GoogleSheetConnector import
+from .GoogleSheetConnector import GoogleSheetConnector
+from .MboxConnector import MboxConnector # Added MboxConnector import
 # Configuration values (PROJECT_ID, etc.) are no longer imported directly from utilities.
 # They should be passed by the caller of get_connector.
 
@@ -12,13 +13,14 @@ def get_connector(source_type: str, **kwargs) -> DBConnector:
     Factory function to get a database connector instance.
 
     Args:
-        source_type (str): Type of the data source (e.g., 'bigquery', 'postgresql', 'firestore', 'json', 'googlesheet').
+        source_type (str): Type of the data source (e.g., 'bigquery', 'postgresql', 'firestore', 'json', 'googlesheet', 'mbox').
         **kwargs: Connector-specific configuration arguments.
                   Expected for 'bigquery': project_id, region, opendataqna_dataset, audit_log_table_name
                   Expected for 'postgresql': project_id, region, instance_name, database_name, database_user, database_password
                   Expected for 'firestore': project_id, firestore_database
                   Expected for 'json': file_path or json_data (and other optional DBConnector args)
                   Expected for 'googlesheet': sheet_id_or_url, credentials_path (and optional worksheet_name, project_id, database_name)
+                  Expected for 'mbox': file_path (and other optional DBConnector args)
 
     Returns:
         DBConnector: An instance of the appropriate DBConnector.
@@ -91,6 +93,19 @@ def get_connector(source_type: str, **kwargs) -> DBConnector:
             # These are already passed to GoogleSheetConnector's **kwargs and handled by its super().__init__
             **kwargs # Pass remaining kwargs for DBConnector base class flexibility
         )
+    elif source_type_lower == 'mbox':
+        required_mbox_args = ['file_path']
+        missing_mbox_args = [k for k in required_mbox_args if kwargs.get(k) is None]
+        if missing_mbox_args:
+            raise ValueError(f"Missing required arguments for Mbox connector: {', '.join(missing_mbox_args)}")
+        
+        return MboxConnector(
+            file_path=kwargs['file_path'],
+            project_id=kwargs.get('project_id'), # Optional, for DBConnector base
+            database_name=kwargs.get('database_name', kwargs['file_path']), # Default to file_path
+            # Pass other optional DBConnector fields if provided in kwargs
+            **kwargs # Pass remaining kwargs for DBConnector base class flexibility
+        )
     else:
         raise ValueError(f"Unknown source_type: {source_type}")
 
@@ -110,7 +125,8 @@ __all__ = [
     'BQConnector', 
     'FirestoreConnector',
     'JsonConnector',
-    'GoogleSheetConnector', # Added GoogleSheetConnector to __all__
+    'GoogleSheetConnector',
+    'MboxConnector', # Added MboxConnector to __all__
     'pg_specific_data_types', 
     'bq_specific_data_types'
 ]

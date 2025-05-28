@@ -1,12 +1,16 @@
 import pytest
 from unittest.mock import patch, MagicMock, mock_open
 import pandas as pd
-import json # Added for JsonConnector tests
+from pandas.testing import assert_frame_equal
+import json 
 import gspread # for gspread.exceptions
+import mailbox # Added for MboxConnector tests
+from email.message import Message # Added for MboxConnector tests
+from email.utils import parsedate_to_datetime # For date parsing comparison
 
 # Assuming dbconnectors and utilities are importable.
 # This might require specific PYTHONPATH setup depending on execution environment.
-from dbconnectors import get_connector, DBConnector, BQConnector, PgConnector, FirestoreConnector, JsonConnector, GoogleSheetConnector # Added GoogleSheetConnector
+from dbconnectors import get_connector, DBConnector, BQConnector, PgConnector, FirestoreConnector, JsonConnector, GoogleSheetConnector, MboxConnector # Added MboxConnector
 from utilities import (
     PROJECT_ID, BQ_REGION, BQ_OPENDATAQNA_DATASET_NAME, BQ_LOG_TABLE_NAME,
     PG_REGION, PG_INSTANCE, PG_DATABASE, PG_USER, PG_PASSWORD,
@@ -43,6 +47,10 @@ VALID_GSHEET_KWARGS = {
     "credentials_path": "dummy_creds.json",
     "worksheet_name": "Sheet1", 
     "project_id": PROJECT_ID 
+}
+VALID_MBOX_KWARGS = {
+    "file_path": "dummy.mbox",
+    "project_id": PROJECT_ID # Optional, for base
 }
 
 
@@ -497,6 +505,233 @@ class TestGoogleSheetConnector:
         # Minimal init, _connect won't be called unless retrieve_df is
         with patch('gspread.service_account'): # Mock to allow init
             connector = GoogleSheetConnector(**VALID_GSHEET_KWARGS)
+        
+        with pytest.raises(NotImplementedError):
+            connector.getExactMatches("query")
+        with pytest.raises(NotImplementedError):
+            connector.getSimilarMatches("mode", "group", [], 1, 0.1)
+        with pytest.raises(NotImplementedError):
+            connector.make_audit_entry("s_type", "group", "model", "q", "sql", "fv", "nr", "fs", "em", "flt")
+        with pytest.raises(NotImplementedError):
+            connector.return_table_schema_sql("dataset")
+        with pytest.raises(NotImplementedError):
+            connector.return_column_schema_sql("dataset")
+        with pytest.raises(NotImplementedError):
+            connector.test_sql_plan_execution("sql")
+        with pytest.raises(NotImplementedError):
+            connector.get_column_samples(pd.DataFrame())
+        with pytest.raises(NotImplementedError):
+            connector.log_chat("sid", "uq", "sql", "uid")
+        with pytest.raises(NotImplementedError):
+            connector.get_chat_logs_for_session("sid")
+
+
+# --- Tests for MboxConnector in get_connector factory ---
+
+def test_get_mbox_connector_successful():
+    """Test successful creation of MboxConnector via factory."""
+    # mailbox.mbox is not called during init, so no need to mock for this factory test.
+    connector = get_connector('mbox', **VALID_MBOX_KWARGS)
+    assert isinstance(connector, DBConnector)
+    assert isinstance(connector, MboxConnector)
+    assert connector.connectorType == "MBOX"
+
+def test_get_mbox_connector_missing_args():
+    """Test get_connector for Mbox with missing file_path."""
+    with pytest.raises(ValueError, match="Missing required arguments for Mbox connector: file_path"):
+        get_connector('mbox')
+
+# --- Fixture for MboxConnector tests ---
+@pytest.fixture
+def mock_mbox_file(mocker):
+    """Mocks mailbox.mbox and the messages it yields."""
+    mock_mbox_obj = MagicMock(spec=mailbox.mbox)
+    
+    # Create sample email.message.Message objects
+    msg1 = Message()
+    msg1['From'] = "sender1@example.com"
+    msg1['To'] = "receiver1@example.com"
+    msg1['Subject'] = "Test Subject 1"
+    msg1['Date'] = "Tue, 15 Jan 2024 10:00:00 +0000"
+    msg1.set_payload("This is body 1.", charset="utf-8")
+
+    msg2 = Message()
+    msg2['From'] = "sender2@example.com"
+    msg2['To'] = "receiver2@example.com"
+    msg2['Cc'] = "cc@example.com"
+    msg2['Subject'] = "Test Subject 2"
+    msg2['Date'] = "Wed, 16 Jan 2024 12:00:00 +0000"
+    # Example of a multipart message
+    msg2.make_multipart("alternative") # Specify a type for multipart
+    part_text = Message()
+    part_text.set_payload("This is plain text body 2.", charset="utf-8")
+    part_text.set_param('content-type', 'text/plain', header='Content-Type') 
+    msg2.attach(part_text)
+    
+    # Configure the mock_mbox_obj to be iterable and yield these messages
+    mock_mbox_obj.__iter__.return_value = iter([msg1, msg2])
+    
+    # Patch mailbox.mbox to return this mock object
+    mocker.patch('mailbox.mbox', return_value=mock_mbox_obj)
+    return mock_mbox_obj
+
+# --- Tests for MboxConnector class itself ---
+
+class TestMboxConnector:
+
+    def test_mbox_connector_init(self):
+        """Test MboxConnector __init__ with required args."""
+        connector = MboxConnector(file_path="test.mbox")
+        assert connector.file_path == "test.mbox"
+
+    def test_mbox_retrieve_df_success(self, mock_mbox_file):
+        """Test retrieve_df success with mocked mbox file."""
+        connector = MboxConnector(file_path="dummy.mbox")
+        df = connector.retrieve_df()
+
+        expected_data = [
+            {
+                'From': "sender1@example.com", 'To': "receiver1@example.com", 'Cc': None,
+                'Subject': "Test Subject 1", 'Date': parsedate_to_datetime("Tue, 15 Jan 2024 10:00:00 +0000"),
+                'Body': "This is body 1."
+            },
+            {
+                'From': "sender2@example.com", 'To': "receiver2@example.com", 'Cc': "cc@example.com",
+                'Subject': "Test Subject 2", 'Date': parsedate_to_datetime("Wed, 16 Jan 2024 12:00:00 +0000"),
+                'Body': "This is plain text body 2."
+            }
+        ]
+        expected_df = pd.DataFrame(expected_data)
+        
+        # Check specific columns as direct DataFrame comparison can be tricky with mixed types / None
+        assert_frame_equal(df[['From', 'To', 'Cc', 'Subject', 'Body']], 
+                           expected_df[['From', 'To', 'Cc', 'Subject', 'Body']])
+        # For date, ensure it's parsed, allow for potential timezone differences if not handled identically
+        assert pd.to_datetime(df['Date'].iloc[0]).year == 2024
+        assert pd.to_datetime(df['Date'].iloc[1]).year == 2024
+        
+        mailbox.mbox.assert_called_once_with("dummy.mbox")
+
+    def test_mbox_retrieve_df_empty_mbox(self, mocker):
+        """Test retrieve_df with an empty mbox file."""
+        mock_empty_mbox_obj = MagicMock(spec=mailbox.mbox)
+        mock_empty_mbox_obj.__iter__.return_value = iter([]) # Yields nothing
+        mocker.patch('mailbox.mbox', return_value=mock_empty_mbox_obj)
+        
+        connector = MboxConnector(file_path="empty.mbox")
+        df = connector.retrieve_df()
+        
+        assert df.empty
+        pd.testing.assert_frame_equal(df, pd.DataFrame())
+
+    def test_mbox_retrieve_df_file_not_found(self, mocker):
+        """Test retrieve_df when FileNotFoundError is raised by mailbox.mbox."""
+        mocker.patch('mailbox.mbox', side_effect=FileNotFoundError("MBOX file not found"))
+        connector = MboxConnector(file_path="non_existent.mbox")
+        with pytest.raises(FileNotFoundError, match="MBOX file not found: non_existent.mbox"):
+            connector.retrieve_df()
+
+    def test_mbox_retrieve_df_corrupted_mbox(self, mocker):
+        """Test retrieve_df with a generic Exception from mailbox.mbox (simulating corruption)."""
+        mocker.patch('mailbox.mbox', side_effect=Exception("Corrupted mbox format"))
+        connector = MboxConnector(file_path="corrupted.mbox")
+        with pytest.raises(RuntimeError, match="Error reading MBOX file corrupted.mbox: Corrupted mbox format"):
+            connector.retrieve_df()
+
+    def test_mbox_retrieve_df_message_parsing_error(self, mocker):
+        """Test retrieve_df when a single message causes a parsing error."""
+        mock_mbox_obj = MagicMock(spec=mailbox.mbox)
+        
+        msg1_good = Message()
+        msg1_good['From'] = "sender1@example.com"
+        msg1_good['Subject'] = "Good Message"
+        msg1_good['Date'] = "Tue, 15 Jan 2024 10:00:00 +0000"
+        msg1_good.set_payload("Good body")
+
+        # Simulate a message that will cause an error (e.g., missing a critical header that MboxConnector tries to access directly)
+        # The MboxConnector code uses direct access like message['From'] which can cause KeyError
+        msg2_bad = Message() 
+        # Missing 'From', 'To', 'Cc', 'Subject', 'Date' which are accessed directly.
+        # This will trigger the `except Exception as e_msg` block in retrieve_df for this message.
+        
+        msg3_good = Message()
+        msg3_good['From'] = "sender3@example.com"
+        msg3_good['Subject'] = "Another Good Message"
+        msg3_good['Date'] = "Wed, 16 Jan 2024 14:00:00 +0000"
+        msg3_good.set_payload("Good body 3")
+
+        mock_mbox_obj.__iter__.return_value = iter([msg1_good, msg2_bad, msg3_good])
+        mocker.patch('mailbox.mbox', return_value=mock_mbox_obj)
+        
+        connector = MboxConnector(file_path="mixed.mbox")
+        df = connector.retrieve_df()
+        
+        assert len(df) == 3
+        assert df.iloc[0]['Subject'] == "Good Message"
+        assert 'Error' in df.iloc[1] # Check for the error entry
+        assert df.iloc[2]['Subject'] == "Another Good Message"
+
+
+    def test_mbox_get_email_body_various_messages(self):
+        """Test _get_email_body with various Message objects."""
+        connector = MboxConnector(file_path="dummy.mbox") # File path needed for init
+
+        # Simple plain text
+        msg_plain = Message()
+        msg_plain.set_payload("Hello plain", charset="utf-8")
+        assert connector._get_email_body(msg_plain) == "Hello plain"
+
+        # Multipart with text/plain
+        msg_multi_plain = Message()
+        msg_multi_plain.make_multipart("alternative")
+        part_text = Message()
+        part_text.set_payload("Hello multipart plain", charset="utf-8")
+        part_text.set_param('content-type', 'text/plain', header='Content-Type')
+        msg_multi_plain.attach(part_text)
+        part_html = Message() # Add another part to ensure it picks text/plain
+        part_html.set_payload("<html><body>Hello HTML</body></html>", charset="utf-8")
+        part_html.set_param('content-type', 'text/html', header='Content-Type')
+        msg_multi_plain.attach(part_html)
+        assert connector._get_email_body(msg_multi_plain) == "Hello multipart plain"
+
+        # Multipart with no text/plain but other text/* (e.g. html only)
+        msg_multi_html_only = Message()
+        msg_multi_html_only.make_multipart("related")
+        part_html_content = Message()
+        part_html_content.set_payload("<b>HTML Only</b>", charset="utf-8")
+        part_html_content.set_param('content-type', 'text/html', header='Content-Type')
+        msg_multi_html_only.attach(part_html_content)
+        assert connector._get_email_body(msg_multi_html_only) == "<b>HTML Only</b>" # Fallback to first text/*
+
+        # Message with no payload (should return empty or error string)
+        msg_no_payload = Message()
+        assert connector._get_email_body(msg_no_payload) == "" # Or specific error string if preferred
+
+        # Message with problematic charset (ensure it falls back or uses 'replace')
+        msg_bad_charset = Message()
+        # Simulate payload that would fail strict utf-8 if charset was misidentified as utf-8
+        # but is actually latin-1 or cp1252.
+        # The connector tries utf-8 then latin-1.
+        # Here, we use a valid UTF-8 string but pretend the charset is 'unknown-charset'
+        # to test the fallback logic within _get_email_body when charset is None or problematic.
+        # The MboxConnector code, if charset is None, tries utf-8 then latin-1.
+        # If charset is given but bad, it would depend on .decode(errors='replace')
+        payload_bytes = "olé".encode('latin-1') # Spanish word "olé" encoded in latin-1
+        msg_bad_charset.set_payload(payload_bytes) # No charset specified, will try utf-8 then latin-1
+        # If it tried UTF-8 first and failed, then latin-1 should succeed.
+        assert connector._get_email_body(msg_bad_charset) == "olé" 
+        
+        # Message with payload that cannot be decoded by utf-8 or latin-1
+        msg_undecodable = Message()
+        # Using bytes that are invalid for both utf-8 and latin-1
+        # For example, some control characters or undefined sequences
+        msg_undecodable.set_payload(b'\x81\x81') # \x81 is undefined in latin-1 and invalid in utf-8
+        assert connector._get_email_body(msg_undecodable) == "[Could not decode message body]"
+
+
+    def test_mbox_connector_interface_methods_not_implemented(self):
+        """Test that other DBConnector interface methods raise NotImplementedError."""
+        connector = MboxConnector(file_path="dummy.mbox")
         
         with pytest.raises(NotImplementedError):
             connector.getExactMatches("query")

@@ -125,3 +125,34 @@ Where:
 *   **No Direct SQL Querying**: The system does not perform SQL-like queries directly against the Google Sheet itself.
 *   **No Vector Store Features**: Features related to schema embedding, table/column similarity search, and example query matching (which are available for SQL databases connected to the vector store) are not applicable to Google Sheets sources in the current implementation. The focus is on direct data retrieval and interpretation from the specified sheet.
 *   **Read-Only**: The current connector is designed for read-only access.
+
+### Using MBOX Files (Email Archives) as a Data Source
+
+The Open Data QnA application now supports using local MBOX files as a direct data source. MBOX is a common format for storing email archives, such as those exported from Gmail using Google Takeout. This feature allows you to ask questions about the content of your email archives.
+
+**Specifying an MBOX File:**
+
+To use an MBOX file, provide its relative or absolute file path (the path must end with `.mbox`) as the input parameter that normally specifies the database or schema name (e.g., the `user_grouping` argument in `opendataqna.py` or the equivalent in the UI).
+
+*Example:*
+To ask questions about a local MBOX file named `my_emails.mbox`, you would typically pass `my_emails.mbox` as the data source identifier.
+`python opendataqna.py --user_question "What were the subjects of emails from sender@example.com?" --user_grouping "my_emails.mbox"`
+
+**Data Extraction:**
+
+The MBOX connector parses the MBOX file and extracts key information from each email message. This data is then structured into a table-like format (a pandas DataFrame) where each row represents an email. The following fields are extracted:
+
+*   `From`: The sender's email address.
+*   `To`: The recipient(s)' email address(es).
+*   `Cc`: The CC recipient(s)' email address(es).
+*   `Subject`: The subject line of the email.
+*   `Date`: The date and time the email was sent, parsed into a datetime object.
+*   `Body`: The plain text content of the email body. The connector attempts to extract the most relevant plain text part from potentially multipart emails.
+
+**Current Functionality & Limitations:**
+
+*   **Data Loading**: The entire MBOX file is parsed, and email data is loaded into an in-memory pandas DataFrame. Natural language questions are answered based on this DataFrame.
+*   **No SQL Querying**: The system does not perform SQL-like queries directly on the MBOX file.
+*   **Attachment Processing**: Email attachments are not processed, indexed, or included in the extracted data.
+*   **Body Extraction**: The body extraction focuses on plain text content. While it attempts to handle multipart emails, complex HTML emails might have their textual representation simplified, and some formatting or non-text content will be lost.
+*   **No Vector Store Features**: Features related to schema embedding, table/column similarity search, and example query matching (which are available for SQL databases) are not applicable to MBOX data sources. The system relies on the LLM's ability to understand and answer questions based on the textual content of the emails in the DataFrame.
