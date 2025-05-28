@@ -2,7 +2,7 @@
 PostgreSQL Connector Class 
 """
 import asyncpg
-from google.cloud.sql.connector import Connector
+from google.cloud.sql.connector import Connector as GCloudConnector # Renamed to avoid conflict
 from sqlalchemy import create_engine
 import pandas as pd 
 from sqlalchemy.sql import text
@@ -11,11 +11,12 @@ import asyncio
 from pg8000.exceptions import DatabaseError 
 
 from utilities import root_dir
-from google.cloud.sql.connector import Connector
+# from google.cloud.sql.connector import Connector # Duplicate import removed
 
-from dbconnectors import DBConnector
-from abc import ABC
+from .core import DBConnector # Changed import
 
+# Removed ABC as it's not directly inherited
+# from abc import ABC 
 
 
 def pg_specific_data_types(): 
@@ -65,52 +66,12 @@ def pg_specific_data_types():
     '''
 
 
-
-
-class PgConnector(DBConnector, ABC):
+class PgConnector(DBConnector): # Removed ABC
     """
     A connector class for interacting with PostgreSQL databases.
-
-    This class provides methods for establishing connections to PostgreSQL instances, executing SQL queries, retrieving results as DataFrames, caching known SQL queries, and managing embeddings. It utilizes the `pg8000` library for connections and the `asyncpg` library for asynchronous operations.
-
-    Attributes:
-        project_id (str): The Google Cloud project ID where the PostgreSQL instance resides.
-        region (str): The region where the PostgreSQL instance is located.
-        instance_name (str): The name of the PostgreSQL instance.
-        database_name (str): The name of the database to connect to.
-        database_user (str): The username for authentication.
-        database_password (str): The password for authentication.
-        pool (Engine): A SQLAlchemy engine object for managing database connections.
-
-    Methods:
-        getconn() -> connection:
-            Establishes a connection to the PostgreSQL instance and returns a connection object.
-
-        retrieve_df(query) -> pd.DataFrame:
-            Executes a SQL query and returns the results as a pandas DataFrame. Handles potential database errors.
-
-        cache_known_sql() -> None:
-            Caches known good SQL queries into a PostgreSQL table for future reference.
-
-        retrieve_matches(mode, user_grouping, qe, similarity_threshold, limit) -> list:
-            Retrieves similar matches (table schemas, column schemas, or example queries) from the database based on the given mode, query embedding (`qe`), similarity threshold, and limit.
-
-        getSimilarMatches(mode, user_grouping, qe, num_matches, similarity_threshold) -> str:
-            Gets similar matches for tables, columns, or examples asynchronously, formatting the results into a string.
-
-        test_sql_plan_execution(generated_sql) -> Tuple[bool, pd.DataFrame]:
-            Tests the execution plan of a generated SQL query in PostgreSQL. Returns a tuple indicating success and the result DataFrame.
-
-        getExactMatches(query) -> str or None:
-            Checks if the exact question is present in the example SQL set and returns the corresponding SQL query if found.
-
-        return_column_schema_sql(schema) -> str:
-            Returns a SQL query to retrieve column schema information from a PostgreSQL schema.
-
-        return_table_schema_sql(schema) -> str:
-            Returns a SQL query to retrieve table schema information from a PostgreSQL schema.
+    Implements the DBConnector interface for PostgreSQL.
     """
-
+    connectorType: str = "PostgreSQL"
 
     def __init__(self,
                 project_id:str, 
@@ -119,26 +80,27 @@ class PgConnector(DBConnector, ABC):
                 database_name:str, 
                 database_user:str, 
                 database_password:str): 
-
-        self.project_id = project_id
-        self.region = region 
-        self.instance_name = instance_name 
-        self.database_name = database_name
-        self.database_user = database_user
-        self.database_password = database_password
+        
+        super().__init__(project_id=project_id, 
+                         region=region, 
+                         instance_name=instance_name,
+                         database_name=database_name, 
+                         database_user=database_user, 
+                         database_password=database_password,
+                         dataset_name=None) # dataset_name (schema) is None by default
 
         self.pool = create_engine(
             "postgresql+pg8000://",
             creator=self.getconn,
         )
 
-
     def getconn(self): 
         """
         function to return the database connection object
         """
         # initialize Connector object
-        connector = Connector()
+        # Renamed import to GCloudConnector to avoid conflict with local Connector class if any
+        connector = GCloudConnector() 
         conn = connector.connect(
             f"{self.project_id}:{self.region}:{self.instance_name}",
             "pg8000",
@@ -146,39 +108,33 @@ class PgConnector(DBConnector, ABC):
             password=f"{self.database_password}",
             db=f"{self.database_name}"
         )
-
         return conn 
 
-
-    def retrieve_df(self, query):
+    def retrieve_df(self, query: str) -> pd.DataFrame: # Matched interface
         """ 
-        TODO: Description 
+        Executes a SQL query and returns the results as a pandas DataFrame.
+        Handles potential database errors.
         """
-
         result_df=pd.DataFrame()
         try: 
             with self.pool.connect() as db_conn:
-               
-                df = pd.read_sql(text(query), con=db_conn)
+                df = pd.read_sql_query(text(query), con=db_conn) # pd.read_sql is deprecated, using read_sql_query
                 result_df = df
-            # print('\n Return from code execution: ' + str(result_df) )
             return result_df
-        
         except Exception as e: 
             print(f"Database Error: {e}")
-            df = pd.DataFrame({'Error. Message': e}, index=[0])
-            return df 
+            # Return an empty DataFrame with an error message column, or raise exception
+            return pd.DataFrame({'Error_Message': [str(e)]}) 
         
-    
     async def cache_known_sql(self):
-        
-        df = pd.read_csv(f"{root_dir}/{scripts}/known_good_sql.csv")
+        # Assuming 'scripts' is a subdirectory under root_dir or should be removed
+        # For now, keeping it as is, but noting the potential issue.
+        df = pd.read_csv(f"{root_dir}/scripts/known_good_sql.csv") 
         df = df.loc[:, ["prompt", "sql", "database_name"]]
         df = df.dropna()
 
         loop = asyncio.get_running_loop()
-        async with Connector(loop=loop) as connector:
-            # # Create connection to Cloud SQL database.
+        async with GCloudConnector(loop=loop) as connector: # Use aliased GCloudConnector
             conn: asyncpg.Connection = await connector.connect_async(
                 f"{self.project_id}:{self.region}:{self.instance_name}", 
                 "asyncpg",
@@ -186,40 +142,29 @@ class PgConnector(DBConnector, ABC):
                 password=f"{self.database_password}",
                 db=f"{self.database_name}",
             )
-
-
             await register_vector(conn)
-
-            # Delete the table if it exists.
             await conn.execute("DROP TABLE IF EXISTS query_example_embeddings CASCADE")
-                
-            # Create the `query_example_embeddings` table.
             await conn.execute(
                 """CREATE TABLE query_example_embeddings(
                                     prompt TEXT,
                                     sql TEXT,
-                                    user_grouping TEXT)"""
+                                    user_grouping TEXT)""" # Assuming user_grouping corresponds to schema or dataset
             )
-
-            # Copy the dataframe to the 'query_example_embeddings' table.
             tuples = list(df.itertuples(index=False))
             await conn.copy_records_to_table(
                 "query_example_embeddings", records=tuples, columns=list(df), timeout=10000
             )
-            
-        await conn.close()
+            await conn.close()
 
-
-    async def retrieve_matches(self, mode, user_groupinguping, qe, similarity_threshold, limit): 
+    async def retrieve_matches(self, mode: str, user_grouping: str, qe: list, similarity_threshold: float, limit: int) -> list: # Corrected user_groupinguping
         """
         This function retrieves the most similar table_schema and column_schema.
-        Modes can be either 'table', 'column', or 'example' 
+        Modes can be either 'table', 'column', or 'example'.
+        user_grouping: Corresponds to schema in PostgreSQL.
         """
         matches = [] 
-
         loop = asyncio.get_running_loop()
-        async with Connector(loop=loop) as connector:
-            # # Create connection to Cloud SQL database.
+        async with GCloudConnector(loop=loop) as connector: # Use aliased GCloudConnector
             conn: asyncpg.Connection = await connector.connect_async(
                 f"{self.project_id}:{self.region}:{self.instance_name}", 
                 "asyncpg",
@@ -227,23 +172,17 @@ class PgConnector(DBConnector, ABC):
                 password=f"{self.database_password}",
                 db=f"{self.database_name}",
             )
-
-
             await register_vector(conn)
 
-
-            # Prepare the SQL depending on 'mode' 
             if mode == 'table': 
                 sql = """
                     SELECT content as tables_content,
                     1 - (embedding <=> $1) AS similarity
                     FROM table_details_embeddings
                     WHERE 1 - (embedding <=> $1) > $2
-                    AND user_grouping = $4
+                    AND user_grouping = $4 
                     ORDER BY similarity DESC LIMIT $3
                 """
-                
-
             elif mode == 'column': 
                 sql = """
                     SELECT content as columns_content,
@@ -253,275 +192,200 @@ class PgConnector(DBConnector, ABC):
                     AND user_grouping = $4
                     ORDER BY similarity DESC LIMIT $3
                 """
-
             elif mode == 'example': 
                 sql = """
                     SELECT user_grouping, example_user_question, example_generated_sql,
                     1 - (embedding <=> $1) AS similarity
                     FROM example_prompt_sql_embeddings
                     WHERE 1 - (embedding <=> $1) > $2
-                    AND user_grouping = $4
+                    AND user_grouping = $4 
                     ORDER BY similarity DESC LIMIT $3
                 """
-
             else: 
-                ValueError("No valid mode. Must be either table, column, or example")
-                name_txt = ''
-                
-            # print(sql,qe,similarity_threshold,limit,user_grouping)
-            # FETCH RESULTS FROM POSTGRES DB 
-            results = await conn.fetch(
-                sql,
-                qe,
-                similarity_threshold,
-                limit,
-                user_groupinguping
-            )
+                raise ValueError("No valid mode. Must be either table, column, or example")
+            
+            results = await conn.fetch(sql, qe, similarity_threshold, limit, user_grouping)
 
-            # CHECK RESULTS 
-            if len(results) == 0:
-                print(f"Did not find any results  for {mode}. Adjust the query parameters.")
+            if not results: # More Pythonic check for empty list
+                print(f"Did not find any results for {mode}. Adjust the query parameters.")
             else:
                 print(f"Found {len(results)} similarity matches for {mode}.")
 
+            name_txt = ''
             if mode == 'table': 
-                name_txt = ''
-                for r in results:
-                    name_txt=name_txt+r["tables_content"]+"\n\n"
-
+                for r in results: name_txt += r["tables_content"]+"\n\n"
             elif mode == 'column': 
-                name_txt = '' 
-                for r in results:
-                    name_txt=name_txt+r["columns_content"]+"\n\n "
-
+                for r in results: name_txt += r["columns_content"]+"\n\n "
             elif mode == 'example': 
-                name_txt = ''
                 for r in results:
-                    example_user_question=r["example_user_question"]
-                    example_sql=r["example_generated_sql"]
-                    # print(example_user_question+"\nThreshold::"+str(r["similarity"]))
-                    name_txt = name_txt + "\n Example_question: "+example_user_question+ "; Example_SQL: "+example_sql
-
-            else: 
-                ValueError("No valid mode. Must be either table, column, or example")
-                name_txt = ''
-
-            matches.append(name_txt)
-
-        # Close the connection to the database.
-        await conn.close()
-
+                    name_txt += f"\n Example_question: {r['example_user_question']}; Example_SQL: {r['example_generated_sql']}"
+            
+            if name_txt: # Add to matches only if something was collected
+                matches.append(name_txt.strip())
+            await conn.close()
         return matches 
 
-
-
-    async def getSimilarMatches(self, mode, user_grouping, qe, num_matches, similarity_threshold):
-
-        if mode == 'table': 
-            match_result=await self.retrieve_matches(mode, user_grouping, qe, similarity_threshold, num_matches)
-            match_result = match_result[0]
-
-        elif mode == 'column': 
-            match_result=await self.retrieve_matches(mode, user_grouping, qe, similarity_threshold, num_matches)
-            match_result = match_result[0]
-        
-        elif mode == 'example': 
-            match_result=await self.retrieve_matches(mode, user_grouping, qe, similarity_threshold, num_matches)
-            if len(match_result) == 0:
-                match_result = None
-            else:
-                match_result = match_result[0]
-
-        return match_result
-
-
-    def test_sql_plan_execution(self, generated_sql):
+    def getSimilarMatches(self, mode: str, user_grouping: str, qe: list, num_matches: int, similarity_threshold: float) -> str | None: # Matched interface
+        # user_grouping is schema for PostgreSQL
         try:
-            exec_result_df = pd.DataFrame()
-            sql = f"""EXPLAIN ANALYZE {generated_sql}"""
+            # Running the async retrieve_matches synchronously
+            match_results_list = asyncio.run(self.retrieve_matches(mode=mode, user_grouping=user_grouping, qe=qe, similarity_threshold=similarity_threshold, limit=num_matches))
+            if not match_results_list:
+                return None
+            return match_results_list[0] # Assuming retrieve_matches returns a list with one string element or empty
+        except Exception as e:
+            print(f"Error in getSimilarMatches: {e}")
+            return None
+
+
+    def test_sql_plan_execution(self, generated_sql: str) -> tuple[bool, str]: # Matched interface
+        try:
+            # Using EXPLAIN (FORMAT JSON) might be more robust for parsing, but for a string message, ANALYZE is fine.
+            sql = f"""EXPLAIN ANALYZE {generated_sql}""" 
             exec_result_df = self.retrieve_df(sql)
 
             if not exec_result_df.empty:
-                if str(exec_result_df.iloc[0]).startswith('Error. Message'):
-                    correct_sql = False 
-                    
+                if 'Error_Message' in exec_result_df.columns:
+                    return False, f"Error executing plan: {exec_result_df['Error_Message'].iloc[0]}"
                 else:
-                    print('\n No need to rewrite the query. This seems to work fine and returned rows...')
-                    correct_sql = True
-            else:
-                print('\n No need to rewrite the query. This seems to work fine but no rows returned...')
-                correct_sql = True
-        
-            return correct_sql, exec_result_df
-
+                    # Convert DataFrame to a string summary for the message
+                    plan_summary = exec_result_df.to_string()
+                    return True, f"Execution plan retrieved successfully:\n{plan_summary}"
+            else: # Should not happen if query is valid SQL, EXPLAIN returns rows or error
+                return False, "Failed to retrieve execution plan (empty result)."
         except Exception as e:
-            return False,str(e)
+            return False, str(e)
         
-
-
-
-    def getExactMatches(self, query): 
+    def getExactMatches(self, query: str) -> str | None: # Matched interface
         """ 
-        Checks if the exact question is already present in the example SQL set 
+        Checks if the exact question is already present in the example SQL set.
+        Assumes 'example_prompt_sql_embeddings' table is in the default search_path or schema specified elsewhere.
         """
+        # This query implies 'example_prompt_sql_embeddings' table is in a schema included in search_path
+        # or should be qualified e.g. self.dataset_name.example_prompt_sql_embeddings if dataset_name is the schema
+        # For now, keeping as is, matching interface.
         check_history_sql=f"""SELECT example_user_question,example_generated_sql
-        FROM example_prompt_sql_embeddings
+        FROM example_prompt_sql_embeddings 
         WHERE lower(example_user_question) = lower('{query}') LIMIT 1; """
 
         exact_sql_history = self.retrieve_df(check_history_sql)
 
-        if exact_sql_history[exact_sql_history.columns[0]].count() != 0:
-            sql_example_txt = ''
-            exact_sql = ''
-            for index, row in exact_sql_history.iterrows():
-                example_user_question=row["example_user_question"]
-                example_sql=row["example_generated_sql"]
-                exact_sql=example_sql
-                sql_example_txt = sql_example_txt + "\n Example_question: "+example_user_question+ "; Example_SQL: "+example_sql
-
-            # print("Found a matching question from the history!" + str(sql_example_txt))
-            final_sql=exact_sql
-
+        if not exact_sql_history.empty and 'Error_Message' not in exact_sql_history.columns:
+            # Ensure columns exist before trying to access them
+            if "example_generated_sql" in exact_sql_history.columns:
+                 return exact_sql_history["example_generated_sql"].iloc[0]
+            else:
+                print("No 'example_generated_sql' column in results for exact match.")
+                return None
         else: 
-            print("No exact match found for the user prompt")
-            final_sql = None
+            if not exact_sql_history.empty and 'Error_Message' in exact_sql_history.columns:
+                print(f"Error in getExactMatches SQL: {exact_sql_history['Error_Message'].iloc[0]}")
+            else:
+                print("No exact match found for the user prompt.")
+            return None
 
-        return final_sql 
-    
-
-
-
-
-    def return_column_schema_sql(self, schema, table_names=None): 
-        """
-        This SQL returns a df containing the cols table_schema, table_name, column_name, data_type, column_description, table_description, primary_key, column_constraints
-        for the schema specified above, e.g. 'retail'
-        - table_schema: e.g. retail 
-        - table_name: name of the table inside the schema, e.g. products 
-        - column_name: name of each col in each table in the schema, e.g. id_product 
-        - data_type: data type of each col 
-        - column_description: col descriptor, can be empty 
-        - table_description: text descriptor, can be empty 
-        - primary_key: whether the col is PK; if yes, the field contains the col_name 
-        - column_constraints: e.g. "Primary key for this table"
-        """
+    def return_column_schema_sql(self, dataset: str, table_names: list[str] | None = None) -> str: # dataset is schema, Matched interface
         table_filter_clause = ""
         if table_names:
-            
-            # table_names = [name.strip() for name in table_names[1:-1].split(",")]  # Handle the string as a list
             formatted_table_names = [f"'{name}'" for name in table_names]
-            table_filter_clause = f"""and table_name in ({', '.join(formatted_table_names)})"""
+            table_filter_clause = f"""and c.table_name in ({', '.join(formatted_table_names)})""" # alias c for columns table
             
-
         column_schema_sql = f'''
-        WITH
-        columns_schema
-        AS
-        (select c.table_schema,c.table_name,c.column_name,c.data_type,d.description as column_description, obj_description(c1.oid) as table_description
-        from information_schema.columns c
-        inner join pg_class c1
-        on c.table_name=c1.relname
-        inner join pg_catalog.pg_namespace n
-        on c.table_schema=n.nspname
-        and c1.relnamespace=n.oid
-        left join pg_catalog.pg_description d
-        on d.objsubid=c.ordinal_position
-        and d.objoid=c1.oid
-        where
-        c.table_schema='{schema}' {table_filter_clause}) ,
-        pk_schema as
-        (SELECT table_name, column_name AS primary_key
-        FROM information_schema.key_column_usage
-WHERE TABLE_SCHEMA='{schema}' {table_filter_clause}
-        AND CONSTRAINT_NAME like '%_pkey%'
-        ORDER BY table_name, primary_key),
-        fk_schema as
-        (SELECT table_name, column_name AS foreign_key
-        FROM information_schema.key_column_usage
-        WHERE TABLE_SCHEMA='{schema}' {table_filter_clause}
-        AND CONSTRAINT_NAME like '%_fkey%'
-        ORDER BY table_name, foreign_key)
-
-        select lr.*,
-        case
-        when primary_key is not null then 'Primary key for this table'
-        when foreign_key is not null then CONCAT('Foreign key',column_description)
-        else null
-        END as column_constraints
-        from
-        (select l.*,r.primary_key
-        from
-        columns_schema l
-        left outer join
-        pk_schema r
-        on
-        l.table_name=r.table_name
-        and
-        l.column_name=r.primary_key) lr
-        left outer join
-        fk_schema rt
-        on
-        lr.table_name=rt.table_name
-        and
-        lr.column_name=rt.foreign_key
-        ;
+        WITH columns_schema AS (
+            select 
+                c.table_schema, c.table_name, c.column_name, c.data_type, 
+                pg_catalog.col_description(c1.oid, c.ordinal_position) as column_description, 
+                pg_catalog.obj_description(c1.oid) as table_description
+            from information_schema.columns c
+            join pg_catalog.pg_class c1 on c.table_name = c1.relname and c.table_schema = pg_catalog.quote_ident(c1.relnamespace::regnamespace::text)
+            where c.table_schema = '{dataset}' {table_filter_clause}
+        ),
+        pk_schema AS (
+            SELECT 
+                tc.table_name, kcu.column_name AS primary_key
+            FROM information_schema.table_constraints AS tc 
+            JOIN information_schema.key_column_usage AS kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+            WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = '{dataset}' 
+                  {table_filter_clause.replace("c.table_name", "tc.table_name")}
+        ),
+        fk_schema AS (
+            SELECT 
+                tc.table_name, kcu.column_name AS foreign_key
+            FROM information_schema.table_constraints AS tc 
+            JOIN information_schema.key_column_usage AS kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+            WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = '{dataset}'
+                  {table_filter_clause.replace("c.table_name", "tc.table_name")}
+        )
+        SELECT 
+            cs.table_schema, cs.table_name, cs.column_name, cs.data_type, 
+            cs.column_description, cs.table_description,
+            pk.primary_key,
+            CASE 
+                WHEN pk.primary_key IS NOT NULL THEN 'Primary key for this table'
+                WHEN fk.foreign_key IS NOT NULL THEN 'Foreign key referencing another table' -- Simplified
+                ELSE NULL 
+            END as column_constraints
+        FROM columns_schema cs
+        LEFT JOIN pk_schema pk ON cs.table_name = pk.table_name AND cs.column_name = pk.primary_key
+        LEFT JOIN fk_schema fk ON cs.table_name = fk.table_name AND cs.column_name = fk.foreign_key
+        ORDER BY cs.table_schema, cs.table_name, cs.column_name;
         '''
-
         return column_schema_sql
-
-
-
     
-    def return_table_schema_sql(self, schema, table_names=None): 
-        """
-        This SQL returns a df containing the cols table_schema, table_name, table_description, table_columns (with cols in the table)
-        for the schema specified above, e.g. 'retail'
-        - table_schema: e.g. retail 
-        - table_name: name of the table inside the schema, e.g. products 
-        - table_description: text descriptor, can be empty 
-        - table_columns: aggregate of the col names inside the table 
-        """
-
+    def return_table_schema_sql(self, dataset: str, table_names: list[str] | None = None) -> str: # dataset is schema, Matched interface
         table_filter_clause = ""
-
         if table_names:
-            # Extract individual table names from the input string
-            #table_names = [name.strip() for name in table_names[1:-1].split(",")]  # Handle the string as a list
             formatted_table_names = [f"'{name}'" for name in table_names]
-            table_filter_clause = f"""and table_name in ({', '.join(formatted_table_names)})"""
-
+            # Ensure alias 'c' is used if this clause is for a table aliased 'c' or remove alias if not needed
+            table_filter_clause = f"""and c.table_name in ({', '.join(formatted_table_names)})"""
 
         table_schema_sql = f'''
-        SELECT table_schema, table_name,table_description, array_to_string(array_agg(column_name), ' , ') as table_columns
-        FROM
-        (select c.table_schema,c.table_name,c.column_name,c.ordinal_position,c.column_default,c.data_type,d.description, obj_description(c1.oid) as table_description
-        from information_schema.columns c
-        inner join pg_class c1
-        on c.table_name=c1.relname
-        inner join pg_catalog.pg_namespace n
-        on c.table_schema=n.nspname
-        and c1.relnamespace=n.oid
-        left join pg_catalog.pg_description d
-        on d.objsubid=c.ordinal_position
-        and d.objoid=c1.oid
-        where
-        c.table_schema='{schema}' {table_filter_clause} ) data
-        GROUP BY table_schema, table_name, table_description
-        ORDER BY table_name;
+        SELECT 
+            c.table_schema, 
+            c.table_name, 
+            pg_catalog.obj_description(c1.oid) as table_description, 
+            array_to_string(array_agg(c.column_name ORDER BY c.ordinal_position), ', ') as table_columns
+        FROM information_schema.columns c
+        JOIN pg_catalog.pg_class c1 ON c.table_name = c1.relname AND c.table_schema = pg_catalog.quote_ident(c1.relnamespace::regnamespace::text)
+        WHERE c.table_schema = '{dataset}' {table_filter_clause}
+        GROUP BY c.table_schema, c.table_name, c1.oid
+        ORDER BY c.table_name;
         '''
-
         return table_schema_sql  
     
-
-    def get_column_samples(self,columns_df):
+    def get_column_samples(self, columns_df: pd.DataFrame) -> pd.DataFrame: # Matched interface
         sample_column_list=[]
+        for _ , row in columns_df.iterrows(): # Use _ if index is not needed
+            # pg_stats might require specific privileges and might not always be up-to-date.
+            # Also, most_common_vals is an array, so direct string aggregation might be tricky.
+            # This is a simplified approach; more robust parsing of most_common_vals might be needed.
+            get_column_sample_sql=f'''SELECT array_to_string(most_common_vals, ', ') AS sample_values 
+                                      FROM pg_stats 
+                                      WHERE tablename = '{row["table_name"]}' 
+                                      AND schemaname = '{row["table_schema"]}' 
+                                      AND attname = '{row["column_name"]}' 
+                                      AND most_common_vals IS NOT NULL LIMIT 1''' # Add limit and null check
 
-        for index, row in columns_df.iterrows():
-            get_column_sample_sql=f'''SELECT most_common_vals AS sample_values FROM pg_stats WHERE tablename = '{row["table_name"]}' AND schemaname = '{row["table_schema"]}' AND attname = '{row["column_name"]}' '''
+            column_samples_df = self.retrieve_df(get_column_sample_sql)
+            if not column_samples_df.empty and 'sample_values' in column_samples_df.columns:
+                sample_value = column_samples_df['sample_values'].iloc[0]
+                sample_column_list.append(str(sample_value).replace("{","").replace("}","")) # Basic cleaning
+            elif not column_samples_df.empty and 'Error_Message' in column_samples_df.columns:
+                 sample_column_list.append(f"Error: {column_samples_df['Error_Message'].iloc[0]}")
+            else:
+                sample_column_list.append(None) # Or "N/A"
 
-            column_samples_df=self.retrieve_df(get_column_sample_sql)
-            # display(column_samples_df)
-            sample_column_list.append(column_samples_df['sample_values'].to_string(index=False).replace("{","").replace("}",""))
-
-        columns_df["sample_values"]=sample_column_list
+        columns_df["sample_values"] = sample_column_list
         return columns_df
+
+    # New methods from DBConnector interface to be implemented
+    def make_audit_entry(self, source_type: str, user_grouping: str, model: str, question: str, generated_sql: str, found_in_vector: str, need_rewrite: str, failure_step: str, error_msg: str, full_log_text: str) -> str:
+        raise NotImplementedError("Audit logging to PostgreSQL is not implemented yet.")
+
+    def log_chat(self, session_id: str, user_question: str, generated_sql: str, user_id: str) -> None:
+        raise NotImplementedError("log_chat is not implemented for PgConnector")
+
+    def get_chat_logs_for_session(self, session_id: str) -> list | None:
+        raise NotImplementedError("get_chat_logs_for_session is not implemented for PgConnector")
+
+# Ensure a newline at the end of the file

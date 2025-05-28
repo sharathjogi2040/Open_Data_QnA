@@ -3,26 +3,53 @@ import argparse
 import uuid
 
 from agents import EmbedderAgent, BuildSQLAgent, DebugSQLAgent, ValidateSQLAgent, ResponseAgent,VisualizeAgent
-from utilities import (PROJECT_ID, PG_REGION, BQ_REGION, EXAMPLES, LOGGING, VECTOR_STORE,
-                       BQ_OPENDATAQNA_DATASET_NAME, USE_SESSION_HISTORY)
-from dbconnectors import bqconnector, pgconnector, firestoreconnector
+from utilities import (
+    PROJECT_ID, PG_REGION, BQ_REGION, EXAMPLES, LOGGING, VECTOR_STORE,
+    BQ_OPENDATAQNA_DATASET_NAME, BQ_LOG_TABLE_NAME, USE_SESSION_HISTORY, # Added BQ_LOG_TABLE_NAME
+    PG_USER, PG_PASSWORD, PG_DATABASE, PG_INSTANCE # Added PGSQL specific vars
+)
+# Attempt to import FIRESTORE_DATABASE_NAME, use default if not found
+try:
+    from utilities import FIRESTORE_DATABASE_NAME
+except ImportError:
+    FIRESTORE_DATABASE_NAME = "opendataqna-session-logs" # Default value
+
+from dbconnectors import get_connector # Changed import
 from embeddings.store_embeddings import add_sql_embedding
 
+# Initialize vector_connector using the factory
+vector_connector_params = {
+    "project_id": PROJECT_ID,
+}
+if VECTOR_STORE.lower() == 'bigquery-vector':
+    vector_connector_params.update({
+        "region": BQ_REGION,
+        "opendataqna_dataset": BQ_OPENDATAQNA_DATASET_NAME,
+        "audit_log_table_name": BQ_LOG_TABLE_NAME
+    })
+    vector_connector = get_connector(source_type='bigquery', **vector_connector_params)
+    region = BQ_REGION 
+    call_await = False # As interface methods are sync
+elif VECTOR_STORE.lower() == 'cloudsql-pgvector':
+    vector_connector_params.update({
+        "region": PG_REGION,
+        "instance_name": PG_INSTANCE,
+        "database_name": PG_DATABASE, # Main DB for PgConnector instance
+        "database_user": PG_USER,
+        "database_password": PG_PASSWORD
+    })
+    vector_connector = get_connector(source_type='postgresql', **vector_connector_params)
+    region = PG_REGION 
+    call_await = False # As interface methods are sync
+else:
+    raise ValueError("Please specify a valid VECTOR_STORE. Supported are either 'bigquery-vector' or 'cloudsql-pgvector'")
 
-
-#Based on VECTOR STORE in config.ini initialize vector connector and region
-if VECTOR_STORE=='bigquery-vector':
-    region=BQ_REGION
-    vector_connector = bqconnector
-    call_await = False
-
-elif VECTOR_STORE == 'cloudsql-pgvector':
-    region=PG_REGION
-    vector_connector = pgconnector
-    call_await=True
-
-else: 
-    raise ValueError("Please specify a valid Data Store. Supported are either 'bigquery-vector' or 'cloudsql-pgvector'")
+# Initialize Firestore connector instance globally
+firestore_connector_instance = get_connector(
+    source_type='firestore',
+    project_id=PROJECT_ID,
+    firestore_database=FIRESTORE_DATABASE_NAME
+)
 
 
 def generate_uuid():
@@ -173,149 +200,156 @@ async def generate_sql(session_id,
     """
 
     try:
-
-        if session_id is None or session_id=="":
+        if session_id is None or session_id == "":
             print("This is a new session")
-            session_id=generate_uuid()
+            session_id = generate_uuid()
 
-        ## LOAD AGENTS 
+        final_sql = 'Not Generated Yet'
+        invalid_response = False
+        process_step = 'Not Started'
+        error_msg = ''
+        AUDIT_TEXT = ''
+        # Ensure DATA_SOURCE is initialized before the try-except block for LOGGING in exception
+        DATA_SOURCE = 'undefined' 
+        SQLBuilder_model_name = SQLBuilder_model # To use in exception log if DATA_SOURCE is JSON
 
+        # JSON Source Identification
+        if user_grouping.lower().endswith('.json'):
+            DATA_SOURCE = 'json'
+            src_invalid = False
+            print(f"Data source identified as JSON file: {user_grouping}")
+            AUDIT_TEXT = f"JSON Data Source: {user_grouping}\nUser Question: {user_question}\n"
+            final_sql = None  # No SQL for JSON
+            invalid_response = False
+            process_step = "JSON Data Loading (to be done in get_results)"
+            found_in_vector = 'N/A' # Not applicable for JSON
+
+            # Simplified audit logging for JSON
+            if LOGGING:
+                try:
+                    # Only log if vector_connector is BigQuery to avoid NotImplementedError
+                    if vector_connector.connectorType == "BigQuery":
+                        vector_connector.make_audit_entry(
+                            source_type=DATA_SOURCE, user_grouping=user_grouping,
+                            model="N/A_JSON", question=user_question, generated_sql=final_sql,
+                            found_in_vector=found_in_vector, need_rewrite='N/A', failure_step='N/A',
+                            error_msg='', full_log_text=AUDIT_TEXT
+                        )
+                except Exception as audit_e:
+                    print(f"Audit logging failed for JSON source: {audit_e}")
+
+            if USE_SESSION_HISTORY and not invalid_response:
+                firestore_connector_instance.log_chat(session_id, user_question,
+                                                      "Processing JSON data.",  # Placeholder
+                                                      user_id)
+            return final_sql, session_id, invalid_response  # Return early for JSON
+        else:
+            DATA_SOURCE, src_invalid = get_source_type(user_grouping)
+            if src_invalid:
+                # Ensure DATA_SOURCE from get_source_type is a string if it's an error message
+                raise ValueError(str(DATA_SOURCE)) 
+
+        ## LOAD AGENTS (only if not JSON)
         print("Loading Agents.")
-        embedder = EmbedderAgent(Embedder_model) 
+        embedder = EmbedderAgent(Embedder_model)
         SQLBuilder = BuildSQLAgent(SQLBuilder_model)
         SQLChecker = ValidateSQLAgent(SQLChecker_model)
         SQLDebugger = DebugSQLAgent(SQLDebugger_model)
 
-        re_written_qe=user_question
-
+        re_written_qe = user_question
         print("Getting the history for the session.......\n")
-        session_history = firestoreconnector.get_chat_logs_for_session(session_id) if USE_SESSION_HISTORY else None
-        print("Grabbed history for the session:: "+ str(session_history))
+        session_history = firestore_connector_instance.get_chat_logs_for_session(session_id) if USE_SESSION_HISTORY else None
+        print("Grabbed history for the session:: " + str(session_history))
 
         if session_history is None or not session_history:
             print("No records for the session. Not rewriting the question\n")
         else:
-            concated_questions,re_written_qe=SQLBuilder.rewrite_question(user_question,session_history)
+            concated_questions, re_written_qe = SQLBuilder.rewrite_question(user_question, session_history)
 
+        found_in_vector = 'N'  # if an exact query match was found
+        # final_sql, process_step, error_msg already initialized
+        # corrected_sql = '' # Not used outside debugger
 
-        found_in_vector = 'N' # if an exact query match was found 
-        final_sql='Not Generated Yet' # final generated SQL 
-        process_step='Not Started'
-        error_msg=''
-        corrected_sql = ''
-        DATA_SOURCE = 'Yet to determine'
+        print("Source selected as : " + str(DATA_SOURCE) + "\nSchema or Dataset Name is : " + str(user_grouping))
+        print("Vector Store selected as : " + str(VECTOR_STORE))
 
-        DATA_SOURCE,src_invalid = get_source_type(user_grouping)
-
-        if src_invalid:
-            raise ValueError(DATA_SOURCE)
-
-        #vertexai.init(project=PROJECT_ID, location=region)
-        #aiplatform.init(project=PROJECT_ID, location=region)
-
-        print("Source selected as : "+ str(DATA_SOURCE) + "\nSchema or Dataset Name is : "+ str(user_grouping))
-        print("Vector Store selected as : "+ str(VECTOR_STORE))
-
-        # Reset AUDIT_TEXT
         AUDIT_TEXT = 'Creating embedding for given question'
-        # Fetch the embedding of the user's input question 
         embedded_question = embedder.create(re_written_qe)
-
-        
-
         AUDIT_TEXT = AUDIT_TEXT + "\nUser Question : " + str(user_question) + "\nUser Database : " + str(user_grouping)
         process_step = "\n\nGet Exact Match: "
 
-        # Look for exact matches in known questions IF kgq is enabled 
-        if EXAMPLES: 
-            exact_sql_history = vector_connector.getExactMatches(user_question) 
+        if EXAMPLES:
+            exact_sql_history = vector_connector.getExactMatches(user_question)
+        else:
+            exact_sql_history = None
 
-        else: exact_sql_history = None 
-
-        # If exact user query has been found, retrieve the SQL and skip Generation Pipeline 
         if exact_sql_history is not None:
-            found_in_vector = 'Y' 
+            found_in_vector = 'Y'
             final_sql = exact_sql_history
             invalid_response = False
             AUDIT_TEXT = AUDIT_TEXT + "\nExact match has been found! Going to retrieve the SQL query from cache and serve!"
-
-
         else:
-            # No exact match found. Proceed looking for similar entries in db IF kgq is enabled 
-            if EXAMPLES: 
-                AUDIT_TEXT = AUDIT_TEXT +  process_step + "\nNo exact match found in query cache, retrieving relevant schema and known good queries for few shot examples using similarity search...."
+            if EXAMPLES:
+                AUDIT_TEXT = AUDIT_TEXT + process_step + "\nNo exact match found in query cache, retrieving relevant schema and known good queries for few shot examples using similarity search...."
                 process_step = "\n\nGet Similar Match: "
-                if call_await:
-                    similar_sql = await vector_connector.getSimilarMatches('example', user_grouping, embedded_question, num_sql_matches, example_similarity_threshold)
-                else:
-                    similar_sql = vector_connector.getSimilarMatches('example', user_grouping, embedded_question, num_sql_matches, example_similarity_threshold)
-
-            else: similar_sql = "No similar SQLs provided..."
+                similar_sql = vector_connector.getSimilarMatches('example', user_grouping, embedded_question, num_sql_matches, example_similarity_threshold)
+            else:
+                similar_sql = "No similar SQLs provided..."
 
             process_step = "\n\nGet Table and Column Schema: "
-            # Retrieve matching tables and columns
-            if call_await: 
-                table_matches =  await vector_connector.getSimilarMatches('table', user_grouping, embedded_question, num_table_matches, table_similarity_threshold)
-                column_matches =  await vector_connector.getSimilarMatches('column', user_grouping, embedded_question, num_column_matches, column_similarity_threshold)
-            else:
-                table_matches =  vector_connector.getSimilarMatches('table', user_grouping, embedded_question, num_table_matches, table_similarity_threshold)
-                column_matches =  vector_connector.getSimilarMatches('column', user_grouping, embedded_question, num_column_matches, column_similarity_threshold)
+            table_matches = vector_connector.getSimilarMatches('table', user_grouping, embedded_question, num_table_matches, table_similarity_threshold)
+            column_matches = vector_connector.getSimilarMatches('column', user_grouping, embedded_question, num_column_matches, column_similarity_threshold)
+            AUDIT_TEXT = AUDIT_TEXT + process_step + "\nRetrieved Similar Known Good Queries, Table Schema and Column Schema: \n" + '\nRetrieved Tables: \n' + str(table_matches) + '\n\nRetrieved Columns: \n' + str(column_matches) + '\n\nRetrieved Known Good Queries: \n' + str(similar_sql)
 
-            AUDIT_TEXT = AUDIT_TEXT +  process_step + "\nRetrieved Similar Known Good Queries, Table Schema and Column Schema: \n" + '\nRetrieved Tables: \n' + str(table_matches) + '\n\nRetrieved Columns: \n' + str(column_matches) + '\n\nRetrieved Known Good Queries: \n' + str(similar_sql)
-            
-            
-            # If similar table and column schemas found: 
-            if len(table_matches.replace('Schema(values):','').replace(' ','')) > 0 or len(column_matches.replace('Column name(type):','').replace(' ','')) > 0 :
-
-                # GENERATE SQL
+            if len(table_matches.replace('Schema(values):', '').replace(' ', '')) > 0 or len(column_matches.replace('Column name(type):', '').replace(' ', '')) > 0:
                 process_step = "\n\nBuild SQL: "
-                generated_sql = SQLBuilder.build_sql(DATA_SOURCE,user_grouping,user_question,session_history,table_matches,column_matches,similar_sql)
-                final_sql=generated_sql
-                AUDIT_TEXT = AUDIT_TEXT + process_step +  "\nGenerated SQL : " + str(generated_sql)
-                
-                if 'unrelated_answer' in generated_sql :
-                    invalid_response=True
-                    final_sql="This is an unrelated question or you are not asking a valid query"
+                generated_sql = SQLBuilder.build_sql(DATA_SOURCE, user_grouping, user_question, session_history, table_matches, column_matches, similar_sql)
+                final_sql = generated_sql
+                AUDIT_TEXT = AUDIT_TEXT + process_step + "\nGenerated SQL : " + str(generated_sql)
 
-                # If agent assessment is valid, proceed with checks  
+                if 'unrelated_answer' in generated_sql:
+                    invalid_response = True
+                    final_sql = "This is an unrelated question or you are not asking a valid query"
                 else:
-                    invalid_response=False
-
-                    if RUN_DEBUGGER: 
-                        generated_sql, invalid_response, AUDIT_TEXT = SQLDebugger.start_debugger(DATA_SOURCE,user_grouping, generated_sql, user_question, SQLChecker, table_matches, column_matches, AUDIT_TEXT, similar_sql, DEBUGGING_ROUNDS, LLM_VALIDATION) 
-                        # AUDIT_TEXT = AUDIT_TEXT + '\n Feedback from Debugger: \n' + feedback_text
-
-                    final_sql=generated_sql
-                    AUDIT_TEXT = AUDIT_TEXT + "\nFinal SQL after Debugger: \n" +str(final_sql)
-
-
-            # No matching table found 
+                    invalid_response = False
+                    if RUN_DEBUGGER:
+                        generated_sql, invalid_response, AUDIT_TEXT = SQLDebugger.start_debugger(DATA_SOURCE, user_grouping, generated_sql, user_question, SQLChecker, table_matches, column_matches, AUDIT_TEXT, similar_sql, DEBUGGING_ROUNDS, LLM_VALIDATION)
+                    final_sql = generated_sql
+                    AUDIT_TEXT = AUDIT_TEXT + "\nFinal SQL after Debugger: \n" + str(final_sql)
             else:
-                invalid_response=True
+                invalid_response = True
                 print('No tables found in Vector ...')
                 AUDIT_TEXT = AUDIT_TEXT + "\nNo tables have been found in the Vector DB. The question cannot be answered with the provide data source!"
 
-        # print(f'\n\n AUDIT_TEXT: \n {AUDIT_TEXT}')
-
-        if LOGGING: 
-            bqconnector.make_audit_entry(DATA_SOURCE, user_grouping, SQLBuilder_model, user_question, final_sql, found_in_vector, "", process_step, error_msg,AUDIT_TEXT)  
-
+        if LOGGING: # This will only be reached by non-JSON path if no exception before this
+            if vector_connector.connectorType == "BigQuery":
+                vector_connector.make_audit_entry(DATA_SOURCE, user_grouping, SQLBuilder_model_name, user_question, final_sql, found_in_vector, "", process_step, error_msg, AUDIT_TEXT)
 
     except Exception as e:
-        error_msg=str(e)
-        final_sql="Error generating the SQL Please check the logs. "+str(e)
-        invalid_response=True
-        AUDIT_TEXT=AUDIT_TEXT+ "\nException at SQL generation"
-        print("Error :: "+str(error_msg))
-        if LOGGING: 
-            bqconnector.make_audit_entry(DATA_SOURCE, user_grouping, SQLBuilder_model, user_question, final_sql, found_in_vector, "", process_step, error_msg,AUDIT_TEXT)  
+        error_msg = str(e)
+        final_sql = "Error generating the SQL. Please check the logs. " + str(e)
+        invalid_response = True
+        AUDIT_TEXT = (AUDIT_TEXT if AUDIT_TEXT else "") + f"\nException in generate_sql: {error_msg}" # Ensure AUDIT_TEXT is a string
+        print("Error :: " + str(error_msg))
+        if LOGGING and DATA_SOURCE != 'json': # Only log here if not JSON, JSON path logs earlier or this is SQL path error
+            try:
+                if vector_connector.connectorType == "BigQuery": # Or a more generic check
+                    vector_connector.make_audit_entry(
+                        source_type=DATA_SOURCE, user_grouping=user_grouping,
+                        model=SQLBuilder_model_name, question=user_question, generated_sql=final_sql,
+                        found_in_vector=found_in_vector if DATA_SOURCE != 'json' else 'N/A', 
+                        need_rewrite="", # empty string if not applicable
+                        failure_step=process_step, error_msg=error_msg, full_log_text=AUDIT_TEXT
+                    )
+            except Exception as audit_e_exception:
+                print(f"Audit logging failed during exception handling: {audit_e_exception}")
+    
+    # Session log for SQL path (successful or failed SQL gen) or if JSON path failed before early return (less likely)
+    if USE_SESSION_HISTORY and DATA_SOURCE != 'json': # JSON path logs earlier before its early return
+        firestore_connector_instance.log_chat(session_id, user_question, final_sql, user_id)
+        print("Session history persisted for SQL path.")
 
-    if USE_SESSION_HISTORY and not invalid_response:
-        firestoreconnector.log_chat(session_id,user_question,final_sql,user_id)
-        print("Session history persisted")  
-
-
-    return final_sql,session_id,invalid_response
+    return final_sql, session_id, invalid_response
 
 
 ############################
@@ -342,44 +376,76 @@ def get_results(user_grouping, final_sql, invalid_response=False, EXECUTE_FINAL_
         ValueError: If the data source is invalid or not supported.
         Exception: If there's an error executing the SQL query or retrieving the results.
     """
-    
+    result_df = None # Initialize result_df
     try:
-
-        DATA_SOURCE,src_invalid = get_source_type(user_grouping)
-        
-        if not src_invalid:
-            ## SET DATA SOURCE 
-            if DATA_SOURCE=='bigquery':
-                src_connector = bqconnector
-            else: 
-                src_connector = pgconnector
+        # JSON Source Identification
+        if user_grouping.lower().endswith('.json'):
+            DATA_SOURCE = 'json'
+            src_invalid = False
         else:
-            raise ValueError(DATA_SOURCE)
+            DATA_SOURCE, src_invalid = get_source_type(user_grouping)
 
-        if not invalid_response:
-            try: 
+        if src_invalid:
+            # Ensure DATA_SOURCE from get_source_type is a string if it's an error message
+            raise ValueError(str(DATA_SOURCE)) 
+
+        src_connector_params = {"project_id": PROJECT_ID}
+        if DATA_SOURCE.lower() == 'json':
+            src_connector_params.update({"file_path": user_grouping})
+            # Optional: pass other generic params if JsonConnector handles them via **kwargs in its __init__
+            # src_connector_params.update({"database_name": user_grouping}) # Example
+            src_connector = get_connector(source_type='json', **src_connector_params)
+        elif DATA_SOURCE.lower() == 'bigquery':
+            src_connector_params.update({
+                "region": BQ_REGION,
+                "opendataqna_dataset": BQ_OPENDATAQNA_DATASET_NAME,
+                "audit_log_table_name": BQ_LOG_TABLE_NAME
+            })
+            src_connector = get_connector(source_type='bigquery', **src_connector_params)
+        elif DATA_SOURCE.lower() == 'postgresql':
+            src_connector_params.update({
+                "region": PG_REGION,
+                "instance_name": PG_INSTANCE,
+                "database_name": PG_DATABASE,
+                "database_user": PG_USER,
+                "database_password": PG_PASSWORD
+            })
+            src_connector = get_connector(source_type='postgresql', **src_connector_params)
+        else:
+            raise ValueError(f"Unsupported DATA_SOURCE: {DATA_SOURCE}")
+
+        if not invalid_response:  # invalid_response from generate_sql
+            try:
                 if EXECUTE_FINAL_SQL is True:
-                        final_exec_result_df=src_connector.retrieve_df(final_sql.replace("```sql","").replace("```","").replace("EXPLAIN ANALYZE ",""))
-                        result_df = final_exec_result_df
+                    if DATA_SOURCE.lower() == 'json':
+                        # For JSON, final_sql is None from generate_sql path for JSON
+                        # query arg is optional for JsonConnector.retrieve_df
+                        result_df = src_connector.retrieve_df(query=None)
+                    else:
+                        if final_sql is None: # Should not happen for SQL types if generate_sql worked
+                            raise ValueError("final_sql cannot be None for SQL data sources if generate_sql was successful.")
+                        cleaned_sql = final_sql.replace("```sql", "").replace("```", "").replace("EXPLAIN ANALYZE ", "")
+                        result_df = src_connector.retrieve_df(cleaned_sql)
+                else:
+                    print("Not executing final SQL since EXECUTE_FINAL_SQL variable is False\n ")
+                    result_df = "Query execution skipped." # Changed to a string
+                    invalid_response = True # Mark as invalid as no data is loaded
+            except Exception as e_exec: # Catch any execution error
+                print(f"Error during query execution or data retrieval: {e_exec}")
+                result_df = f"Error during query execution or data retrieval: {e_exec}"
+                invalid_response = True
+        else: # invalid_response was true from generate_sql
+            # If final_sql is None (JSON path), use a more specific message.
+            error_source_msg = final_sql if final_sql else "No query generated (e.g. JSON input)"
+            result_df = f"Not executing due to invalid response from previous step: {error_source_msg}"
+            # invalid_response is already True
 
-                else:  # Do not execute final SQL
-                        print("Not executing final SQL since EXECUTE_FINAL_SQL variable is False\n ")
-                        result_df = "Please enable the Execution of the final SQL so I can provide an answer" 
-                        invalid_response = True
-                        
-            except ValueError: 
-                result_df= "Error has been encountered :: " + str(e)
-                invalid_response=True
-                
-        else:  # Do not execute final SQL
-            result_df = "Not executing final SQL as it is invalid, please debug!"
-            
-    except Exception as e: 
-        print(f"An error occured. Aborting... Error Message: {e}")
-        result_df="Error has been encountered :: " + str(e)
-        invalid_response=True
+    except Exception as e_get_res: # Catch errors from get_source_type or connector init
+        print(f"An error occurred in get_results: {e_get_res}")
+        result_df = f"Error in get_results: {e_get_res}" # Ensure result_df is always a string on error path
+        invalid_response = True # Ensure this is set
 
-    return result_df,invalid_response
+    return result_df, invalid_response
 
 def get_response(session_id,user_question,result_df,Responder_model='gemini-1.0-pro'):
     try:
@@ -388,7 +454,7 @@ def get_response(session_id,user_question,result_df,Responder_model='gemini-1.0-
         if session_id is None or session_id=="":
             print("This is a new session")
         else:
-            session_history =firestoreconnector.get_chat_logs_for_session(session_id) if USE_SESSION_HISTORY else None
+            session_history = firestore_connector_instance.get_chat_logs_for_session(session_id) if USE_SESSION_HISTORY else None # MODIFIED
             if session_history is None or not session_history:
                 print("No records for the session. Not rewriting the question\n")
             else:
@@ -573,7 +639,7 @@ async def embed_sql(session_id,user_grouping,user_question,generate_sql):
         if session_id is None or session_id=="":
             print("This is a new session")
         else:
-            session_history =firestoreconnector.get_chat_logs_for_session(session_id) if USE_SESSION_HISTORY else None
+            session_history = firestore_connector_instance.get_chat_logs_for_session(session_id) if USE_SESSION_HISTORY else None # MODIFIED
             if session_history is None or not session_history:
                 print("No records for the session. Not rewriting the question\n")
             else:
@@ -596,7 +662,7 @@ def visualize(session_id,user_question,generated_sql,sql_results):
         if session_id is None or session_id=="":
             print("This is a new session")
         else:
-            session_history =firestoreconnector.get_chat_logs_for_session(session_id) if USE_SESSION_HISTORY else None
+            session_history = firestore_connector_instance.get_chat_logs_for_session(session_id) if USE_SESSION_HISTORY else None # MODIFIED
             if session_history is None or not session_history:
                 print("No records for the session. Not rewriting the question\n")
             else:
