@@ -1,6 +1,6 @@
 import json 
 from abc import ABC
-from .core import Agent, LLM_Model # Assuming .core.Agent and LLM_Model are defined
+from .core import Agent
 from typing import Any # For type hinting if LLM_Model is used directly
 from utilities import PROMPTS, format_prompt # Assuming these are available
 from vertexai.generative_models import HarmCategory, HarmBlockThreshold # Specific to Vertex AI
@@ -27,8 +27,8 @@ class ResponseAgent(Agent, ABC):
     """
     agentType: str = "ResponseAgent"
 
-    def __init__(self, llm_model: LLM_Model, model_name="gemini-1.0-pro", safety_settings=None, **kwargs):
-        super().__init__(llm_model, model_name, **kwargs) # Call base class constructor
+    def __init__(self, model_id="gemini-1.0-pro", safety_settings=None, **kwargs):
+        super().__init__(model_id=model_id, **kwargs) # Call base class constructor
         if safety_settings is None:
             self.safety_settings = {
                 HarmCategory.HARM_CATEGORY_UNSPECIFIED: HarmBlockThreshold.BLOCK_NONE,
@@ -84,10 +84,10 @@ Your explanation:
                 # Avoid sending full tracebacks directly to LLM for explanation if too verbose
                 details=error_details if error_details and len(error_details) < 500 else "No further specific details."
             )
-            try {
+            try:
                 error_explanation = await self._call_llm(error_prompt, **kwargs)
                 return f"I'm sorry, I couldn't answer your question. {error_explanation}"
-            } except Exception as e:
+            except Exception as e:
                 print(f"ResponseAgent: LLM call for error explanation failed: {e}")
                 # Fallback to a more direct, templated error message
                 return f"I'm sorry, I encountered an error processing your request: {error_message}. Please try again later or contact support if the issue persists."
@@ -136,10 +136,10 @@ Based on this, your natural language response to the user is:
 
         # print(f"ResponseAgent: Prompt for Natural Language Response: \n{context_prompt}")
 
-        try {
+        try:
             natural_language_response = await self._call_llm(context_prompt, **kwargs)
             return natural_language_response
-        } except Exception as e:
+        except Exception as e:
             print(f"ResponseAgent: LLM call for generating response failed: {e}")
             return f"I found some information, but I had trouble phrasing a response. The raw data is: {execution_data_string}"
 
